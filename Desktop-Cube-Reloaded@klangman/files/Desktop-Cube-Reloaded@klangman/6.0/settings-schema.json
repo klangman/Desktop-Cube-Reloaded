@@ -1,0 +1,65 @@
+{
+    "head-switch": {
+        "type": "header",
+        "description": "Workspace switching"
+    },
+    "animation-time": {
+        "type": "spinbutton",
+        "default": 400,
+        "min": 100,
+        "max": 2000,
+        "step": 50,
+        "units": "milliseconds",
+        "description": "Rotation duration",
+        "tooltip": "How long the cube takes to rotate to the new workspace."
+    },
+    "last-first-gap": {
+        "type": "switch",
+        "default": true,
+        "description": "Leave a gap between the last and first workspace",
+        "tooltip": "When enabled, the workspaces cover only half a circle, so switching from the last to the first workspace rotates back through all of them. When disabled, the workspaces form a closed cube and wrapping around takes the shortest way."
+    },
+    "window-parallax": {
+        "type": "scale",
+        "default": 0.5,
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "show-value": true,
+        "description": "Window parallax",
+        "tooltip": "How far windows float in front of the cube faces while it rotates. 0 keeps them flat on the faces."
+    },
+    "hide-panels": {
+        "type": "switch",
+        "default": false,
+        "description": "Hide the panels while the cube is shown",
+        "tooltip": "Draws the cube above the panels on the monitors where it rotates, during workspace switches and while dragging the cube. The panels themselves are not changed."
+    },
+    "head-drag": {
+        "type": "header",
+        "description": "Dragging the cube"
+    },
+    "enable-panel-dragging": {
+        "type": "switch",
+        "default": true,
+        "description": "Rotate the cube by dragging an empty part of a panel",
+        "tooltip": "Hold the left mouse button on a panel, away from any applet, and move the mouse. Moving sideways rotates the cube, moving up or down tilts it, and the scroll wheel zooms in and out."
+    },
+    "mouse-rotation-speed": {
+        "type": "scale",
+        "default": 2.0,
+        "min": 0.5,
+        "max": 10.0,
+        "step": 0.5,
+        "show-value": true,
+        "description": "Rotation speed",
+        "dependency": "enable-panel-dragging",
+        "tooltip": "How far the cube rotates for a given mouse movement."
+    },
+    "do-explode": {
+        "type": "switch",
+        "default": true,
+        "description": "Spread the windows apart when the cube is tilted",
+        "dependency": "enable-panel-dragging"
+    }
+}
