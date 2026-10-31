@@ -78,6 +78,12 @@ the extension's reload button in Looking Glass (`Alt+F2`, `lg`, *Extensions* tab
 restart Cinnamon (`Ctrl+Alt+Esc`). Errors show up in Looking Glass and in
 `~/.xsession-errors`.
 
+
+
+## Credit
+
+So far every single line of code is a copy from Simon Schneegans' [Desktop Cube](https://github.com/Schneegans/Desktop-Cube) Gnome version or written by Claude AI based on my prompting with very limited code review. Before I offer this up to Cinnamon Spices I will do a more detailed code review.
+
 ## License
 
 GPL-3.0-or-later, like the original extension.
