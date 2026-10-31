@@ -92,7 +92,7 @@ the extension's reload button in Looking Glass (`Alt+F2`, `lg`, *Extensions* tab
 
 ## Credit
 
-So far every single line of code is a copy from Simon Schneegans' [Desktop Cube](https://github.com/Schneegans/Desktop-Cube) Gnome version or written by Claude AI based on my prompting with very limited code review. Before I offer this up to Cinnamon Spices I will do a more detailed code review.
+So far every single line of code is a copy from Simon Schneegans' [Desktop Cube](https://github.com/Schneegans/Desktop-Cube)  (the Gnome version) or my [Blur Cinnamon](https://github.com/klangman/BlurCinnamon) or written by Claude AI based on my prompting with very limited code review. Before I offer this up to Cinnamon Spices I will do a more detailed code review.
 
 The extension icon is Simon Schneegans' Desktop Cube icon, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
