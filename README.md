@@ -4,9 +4,7 @@ A Cinnamon extension that rotates your workspaces as the faces of a 3D cube.
 
 This is a port of Simon Schneegans' [Desktop Cube](https://github.com/Schneegans/Desktop-Cube) extension for GNOME Shell.
 
-Thie Cinnamon port is called "Reloaded" because Cinnamon already has a simpler Desktop Cube extension.
-
-
+This Cinnamon port is called "Reloaded" because Cinnamon already has a simpler Desktop Cube extension.
 
 ![screen shot](Desktop-Cube-Reloaded@klangman/screenshot.png)
 
