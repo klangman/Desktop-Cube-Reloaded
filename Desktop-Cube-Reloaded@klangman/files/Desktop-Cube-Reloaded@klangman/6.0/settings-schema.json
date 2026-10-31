@@ -22,6 +22,7 @@
                 "animation-time",
                 "last-first-gap",
                 "window-parallax",
+                "auto-zoom-out",
                 "hide-panels"
             ]
         },
@@ -123,6 +124,18 @@
         "default": 0.5,
         "tooltip": "How far windows float in front of the cube faces while it rotates. 0 keeps them flat on the faces.",
         "digits": 2
+    },
+    "auto-zoom-out": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "CompactScale",
+        "description": "Zoom out while the cube moves (%)",
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "default": 10,
+        "tooltip": "While the cube rotates, it moves back until it looks this much smaller than the screen, then comes forward again as it stops. When you rotate the cube with the mouse, it zooms out as you start moving the mouse. 0 turns it off.",
+        "digits": 0
     },
     "hide-panels": {
         "type": "switch",

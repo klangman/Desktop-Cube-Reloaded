@@ -26,6 +26,10 @@
 //   pitch     vertical tilt in [-1, 1], times MAX_VERTICAL_ROTATION degrees.
 //   zoom      extra distance in pixels, set with the scroll wheel while dragging
 //             (positive = closer). This is our own addition, not in the GNOME version.
+//   autoZoom  in [0, 1]: how much of the "zoom out while the cube moves" setting is
+//             applied right now. During a switch it follows the animation; during a
+//             mouse rotation it follows how far the mouse has moved. Also our own
+//             addition.
 //
 // The cube is shown in three situations ("modes"):
 //   switch    Muffin switched workspaces (e.g. Ctrl+Alt+Arrow); we animate to it.
@@ -64,6 +68,12 @@ const SHORTCUT_NAME = 'desktop-cube-reloaded-rotate';
 const ZOOM_STEP = 0.1;
 const MAX_ZOOM_IN = 0.3;
 const MAX_ZOOM_OUT = 3.0;
+
+// "Zoom out while the cube moves": part of a switch animation spent zooming out (and
+// the same at the end for zooming back in), and how many pixels the mouse has to
+// travel during a mouse rotation for the full zoom-out.
+const AUTO_ZOOM_EDGE = 0.3;
+const AUTO_ZOOM_DRAG_DISTANCE = 150;
 
 let desktopCube = null;
 
@@ -290,6 +300,11 @@ class DesktopCube {
     this._anim.mode = 'drag';
     this._anim.dragStartProgress = this._nearestEquivalent(
       global.workspace_manager.get_active_workspace_index(), this._anim.progress);
+
+    // The automatic zoom-out follows the mouse: it grows with the distance the mouse
+    // travels, starting from wherever a running switch animation had it.
+    this._anim.dragAutoZoomStart = this._anim.autoZoom;
+    this._anim.dragDistance = 0;
     return true;
   }
 
@@ -303,8 +318,9 @@ class DesktopCube {
     this._animateTo(anim.dragStartProgress, this._settings.getValue('animation-time'));
   }
 
-  // deltaX is the horizontal mouse movement in pixels, pitch is in [-1, 1].
-  updateDrag(deltaX, pitch) {
+  // deltaX is the horizontal mouse movement in pixels, pitch is in [-1, 1], and moved is
+  // how far the mouse travelled since the last update (in any direction).
+  updateDrag(deltaX, pitch, moved = 0) {
     const anim = this._anim;
     if (!anim || anim.mode !== 'drag') {
       return;
@@ -318,6 +334,11 @@ class DesktopCube {
 
     anim.progress = this._clampProgress(anim.progress - deltaX * speed * tiltBoost / width);
     anim.pitch = Math.max(-1, Math.min(1, pitch));
+
+    anim.dragDistance += moved;
+    const start = anim.dragAutoZoomStart;
+    anim.autoZoom = start + (1 - start) *
+      Math.min(1, anim.dragDistance / AUTO_ZOOM_DRAG_DISTANCE);
     this._updateCubes();
   }
 
@@ -377,7 +398,8 @@ class DesktopCube {
       progress: index,
       pitch: 0,
       zoom: 0,
-      start: {progress: index, pitch: 0, zoom: 0},
+      autoZoom: 0,
+      start: {progress: index, pitch: 0, zoom: 0, autoZoom: 0},
       target: {progress: index, pitch: 0, zoom: 0},
       timeline: timeline,
       cubes: [],
@@ -408,6 +430,14 @@ class DesktopCube {
       anim.progress = anim.start.progress + (anim.target.progress - anim.start.progress) * t;
       anim.pitch = anim.start.pitch + (anim.target.pitch - anim.start.pitch) * t;
       anim.zoom = anim.start.zoom + (anim.target.zoom - anim.start.zoom) * t;
+      if (anim.mode === 'settle') {
+        // After a mouse rotation: zoom back in together with the rotation and tilt
+        // (same eased progress), so the cube squares up and comes forward in one motion.
+        anim.autoZoom = anim.start.autoZoom * (1 - t);
+      } else {
+        anim.autoZoom = this._autoZoomEnvelope(timeline.get_elapsed_time() /
+                                               timeline.get_duration(), anim.start.autoZoom);
+      }
       this._updateCubes();
     }));
     anim.completedID = timeline.connect('completed',
@@ -433,11 +463,25 @@ class DesktopCube {
     }
   }
 
+  // How much of the automatic zoom-out to apply at time t (0..1, not eased) of an
+  // animation that started with `start` of it applied: zoom out during the first part
+  // (from wherever it was), hold, and zoom back in during the last part.
+  _autoZoomEnvelope(t, start) {
+    const smooth = x => {
+      x = Math.max(0, Math.min(1, x));
+      return x * x * (3 - 2 * x);
+    };
+    const zoomOut = start + (1 - start) * smooth(t / AUTO_ZOOM_EDGE);
+    const zoomIn = smooth((1 - t) / AUTO_ZOOM_EDGE);
+    return Math.min(zoomOut, zoomIn);
+  }
+
   // Animates from the current position to the given progress, and back to zero pitch
   // and zoom.
   _animateTo(progress, duration) {
     const anim = this._anim;
-    anim.start = {progress: anim.progress, pitch: anim.pitch, zoom: anim.zoom};
+    anim.start = {progress: anim.progress, pitch: anim.pitch, zoom: anim.zoom,
+                  autoZoom: anim.autoZoom};
     anim.target = {progress: progress, pitch: 0, zoom: 0};
 
     const timeline = anim.timeline;
@@ -790,7 +834,7 @@ class DesktopCube {
       cube.actor.set_pivot_point(0.5, 0.5);
       cube.actor.pivot_point_z = -centerDepth;
       cube.actor.rotation_angle_x = pitch * MAX_VERTICAL_ROTATION;
-      cube.actor.translation_z = anim.zoom;
+      cube.actor.translation_z = anim.zoom - this._getAutoZoomDistance(anim.autoZoom, camera);
 
       cube.faces.forEach((face, i) => {
         const angle = this._normalizeAngle((i - progress) * faceAngle);
@@ -879,6 +923,18 @@ class DesktopCube {
     } catch (e) {
       return 60;
     }
+  }
+
+  // How far to move the cube back so that it looks `setting` percent smaller than the
+  // screen, scaled by `amount` (0..1). Something at distance D from the camera looks
+  // s times its size at distance D / s, so we move it back by D * (1 / s - 1).
+  _getAutoZoomDistance(amount, camera) {
+    const percent = this._settings.getValue('auto-zoom-out');
+    if (!percent || amount <= 0) {
+      return 0;
+    }
+    const scale = 1 - Math.min(0.9, percent / 100 * amount);
+    return camera.z * (1 / scale - 1);
   }
 
   // Position of Clutter's virtual camera in stage coordinates: centered in front of
@@ -1813,7 +1869,7 @@ class DragController {
     this._lastX = x;
     this._lastY = y;
     this._lastTime = time;
-    this._cube.updateDrag(deltaX, -this._totalY / height);
+    this._cube.updateDrag(deltaX, -this._totalY / height, Math.hypot(deltaX, deltaY));
 
     if (Math.abs(x - this._centerX) > this._warpMarginX ||
         Math.abs(y - this._centerY) > this._warpMarginY) {
