@@ -13,7 +13,8 @@
 // scene built from clones is shown instead:
 //
 //   root (in Main.uiGroup, directly above global.window_group)
-//   |- one "cube" per rotating monitor
+//   |- the panorama, if any: one clone per rotating monitor (see Skybox)
+//   |- one "cube" per rotating monitor, inside a perspective wrapper (see below)
 //   |    '- one "face" per workspace: wallpaper, desktop layer (icons, desklets), windows
 //   |- one "static" layer per monitor that does not rotate
 //   |    (only when workspaces are on the primary monitor only)
@@ -35,6 +36,16 @@
 //   switch    Muffin switched workspaces (e.g. Ctrl+Alt+Arrow); we animate to it.
 //   drag      The user is dragging a panel; the cube follows the mouse.
 //   settle    The drag ended; we animate to the nearest workspace and then activate it.
+//
+// Per-monitor perspective: Clutter has a single camera, centered on the whole stage, so
+// a cube on a monitor away from the stage center would be seen from the side and look
+// skewed. The GNOME extension fixes this by changing the projection of each stage view
+// (on X11 only for the monitor with the pointer). We use an exact equivalent that works
+// for every monitor on X11 too: viewing the scene from a camera at M is the same as
+// viewing it from the stage camera S after shearing it, i.e. moving each point
+// sideways in proportion to its depth z by (S - M) * z / cameraDistance. Each cube gets
+// a wrapper actor with that shear as its transform. The shear also maps camera M onto
+// camera S, so the depth sorting below keeps working with the stage camera.
 //
 // Pushing a window that is being dragged against the left or right screen edge
 // switches to the next workspace and takes the window along (see EdgeSwitch).
@@ -176,9 +187,7 @@ class DesktopCube {
   // keeps its old background; the new one is used from the next rotation on.
   _updateSkybox() {
     if (this._skybox) {
-      if (this._anim && this._skybox.actor.get_parent() === this._anim.root) {
-        this._anim.root.remove_child(this._skybox.actor);
-      }
+      this._detachSkybox(this._anim);
       this._skybox.destroy();
       this._skybox = null;
     }
@@ -547,11 +556,7 @@ class DesktopCube {
     });
 
     // The skybox is kept between rotations, so take it out before destroying the scene.
-    step(() => {
-      if (this._skybox && anim.root && this._skybox.actor.get_parent() === anim.root) {
-        anim.root.remove_child(this._skybox.actor);
-      }
-    });
+    step(() => this._detachSkybox(anim));
     step(() => {
       if (anim.root) {
         anim.root.destroy();
@@ -588,15 +593,24 @@ class DesktopCube {
     });
     anim.root = root;
 
-    // The panorama, if any, is painted first, behind everything else.
-    if (this._skybox && this._skybox.ready) {
-      root.add_child(this._skybox.actor);
-      this._skybox.placeAtCamera(this._getCamera());
+    // The panorama, if any, is painted first, behind everything else. All monitors'
+    // panoramas share one layer below all cubes, so a cube that swings past the edge of
+    // its monitor still covers the neighbor's panorama. The skybox itself stays hidden;
+    // each rotating monitor shows a clone of it, centered on that monitor's camera.
+    const skybox = this._skybox && this._skybox.ready ? this._skybox : null;
+    anim.skyLayer = new Clutter.Actor();
+    root.add_child(anim.skyLayer);
+    if (skybox) {
+      anim.skyLayer.add_child(skybox.actor);
+      skybox.actor.hide();
+      skybox.placeAtCamera(this._getCamera());
     }
 
     // Per monitor: either a cube with one face per workspace, or a single static layer.
     const layers = monitors.map((monitor, index) => {
       if (isRotating(index)) {
+        const camera = this._getMonitorCamera(monitor);
+
         const cube = new Clutter.Actor({
           x: monitor.x, y: monitor.y, width: monitor.width, height: monitor.height,
         });
@@ -606,8 +620,28 @@ class DesktopCube {
           cube.add_child(face);
           faces.push(face);
         }
-        root.add_child(cube);
+        const wrapper = new Clutter.Actor();
+        this._applyPerspective(wrapper, camera);
+        wrapper.add_child(cube);
+        root.add_child(wrapper);
         anim.cubes.push({monitor: monitor, monitorIndex: index, actor: cube, faces: faces});
+
+        if (skybox) {
+          const clip = new Clutter.Actor();
+          clip.set_clip(monitor.x, monitor.y, monitor.width, monitor.height);
+          const skyWrapper = new Clutter.Actor();
+          this._applyPerspective(skyWrapper, camera);
+          skyWrapper.add_child(new Clutter.Clone({
+            source: skybox.actor,
+            x: camera.x,
+            y: camera.y,
+            width: 1,
+            height: 1,
+            translation_z: camera.z,
+          }));
+          clip.add_child(skyWrapper);
+          anim.skyLayer.add_child(clip);
+        }
         return {faces: faces};
       }
 
@@ -820,7 +854,7 @@ class DesktopCube {
 
     anim.followers.forEach(f => f.clone.set_position(f.actor.x, f.actor.y));
 
-    if (this._skybox && this._skybox.actor.get_parent() === anim.root) {
+    if (anim.skyLayer && this._skybox && this._skybox.actor.get_parent() === anim.skyLayer) {
       this._skybox.setRotation(progress, pitch, anim.nWorkspaces);
     }
 
@@ -949,6 +983,56 @@ class DesktopCube {
     };
   }
 
+  // The camera a monitor's cube should be seen from: centered in front of the monitor
+  // with per-monitor perspective, otherwise Clutter's stage camera.
+  _getMonitorCamera(monitor) {
+    const camera = this._getCamera();
+    if (!this._settings.getValue('per-monitor-perspective')) {
+      return camera;
+    }
+    return {
+      x: monitor.x + monitor.width / 2,
+      y: monitor.y + monitor.height / 2,
+      z: camera.z,
+      fovy: camera.fovy,
+    };
+  }
+
+  // Makes everything inside `actor` look as if seen from `camera` instead of the stage
+  // camera, by shearing it (see "Per-monitor perspective" at the top of this file). The
+  // actor must sit at the stage origin without other transforms.
+  _applyPerspective(actor, camera) {
+    const stage = this._getCamera();
+    const a = (stage.x - camera.x) / stage.z;
+    const b = (stage.y - camera.y) / stage.z;
+    if (Math.abs(a) < 1e-9 && Math.abs(b) < 1e-9) {
+      return;
+    }
+    try {
+      // x' = x + a * z, y' = y + b * z, in column-major order.
+      const matrix = Clutter.Matrix.alloc();
+      matrix.init_from_array([1, 0, 0, 0,
+                              0, 1, 0, 0,
+                              a, b, 1, 0,
+                              0, 0, 0, 1]);
+      actor.set_transform(matrix);
+    } catch (e) {
+      // Without the correction the cube just looks as it does with a single camera.
+      global.logError(`${this._meta.uuid}: per-monitor perspective failed: ${e}`);
+    }
+  }
+
+  // Takes the skybox out of a scene that is about to be destroyed, so it can be reused.
+  _detachSkybox(anim) {
+    if (!anim || !anim.skyLayer || !this._skybox) {
+      return;
+    }
+    if (this._skybox.actor.get_parent() === anim.skyLayer) {
+      anim.skyLayer.remove_child(this._skybox.actor);
+      this._skybox.actor.show();
+    }
+  }
+
   // While rotating, the cube moves back and the windows float in front of the faces.
   // Both effects are zero when facing a workspace. They are small for horizontal
   // rotations, so switching isn't obtrusive, and strong when the cube is tilted.
@@ -1063,7 +1147,9 @@ class Skybox {
     this._faceActors = [];
     this._cosCone = 0;
 
-    this.actor = new Clutter.Actor({name: 'desktop-cube-reloaded-skybox'});
+    // The scene shows clones of this actor, one per monitor. It gets a size of 1x1 so
+    // that clones of the same size draw it without any scaling.
+    this.actor = new Clutter.Actor({name: 'desktop-cube-reloaded-skybox', width: 1, height: 1});
     this._tilt = new Clutter.Actor();
     this._spin = new Clutter.Actor();
     this.actor.add_child(this._tilt);

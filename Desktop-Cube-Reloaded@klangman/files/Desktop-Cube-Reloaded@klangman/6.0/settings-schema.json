@@ -23,7 +23,8 @@
                 "last-first-gap",
                 "window-parallax",
                 "auto-zoom-out",
-                "hide-panels"
+                "hide-panels",
+                "per-monitor-perspective"
             ]
         },
         "edge-section": {
@@ -142,6 +143,12 @@
         "default": false,
         "description": "Hide the panels while the cube is shown",
         "tooltip": "Draws the cube above the panels on the monitors where it rotates, during workspace switches and while dragging the cube. The panels themselves are not changed."
+    },
+    "per-monitor-perspective": {
+        "type": "switch",
+        "default": true,
+        "description": "Correct the perspective on each monitor",
+        "tooltip": "With several monitors, Cinnamon looks at the whole desktop from a single point in front of its center, so a cube on a monitor away from the center is seen from the side and looks skewed. This shows each monitor's cube as seen from straight in front of that monitor."
     },
     "enable-edge-switch": {
         "type": "switch",
