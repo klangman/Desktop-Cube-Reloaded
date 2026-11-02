@@ -595,14 +595,17 @@ class DesktopCube {
 
     // The panorama, if any, is painted first, behind everything else. All monitors'
     // panoramas share one layer below all cubes, so a cube that swings past the edge of
-    // its monitor still covers the neighbor's panorama. The skybox itself stays hidden;
-    // each rotating monitor shows a clone of it, centered on that monitor's camera.
+    // its monitor still covers the neighbor's panorama. Each rotating monitor shows a
+    // clone of the skybox, centered on that monitor's camera. The skybox itself is made
+    // invisible with opacity 0 rather than hidden: Clutter doesn't lay out hidden actors,
+    // so its tiles would have no size and the clones would draw nothing. Clones draw
+    // their source with their own opacity, so they are not affected.
     const skybox = this._skybox && this._skybox.ready ? this._skybox : null;
     anim.skyLayer = new Clutter.Actor();
     root.add_child(anim.skyLayer);
     if (skybox) {
       anim.skyLayer.add_child(skybox.actor);
-      skybox.actor.hide();
+      skybox.actor.opacity = 0;
       skybox.placeAtCamera(this._getCamera());
     }
 
@@ -1029,7 +1032,7 @@ class DesktopCube {
     }
     if (this._skybox.actor.get_parent() === anim.skyLayer) {
       anim.skyLayer.remove_child(this._skybox.actor);
-      this._skybox.actor.show();
+      this._skybox.actor.opacity = 255;
     }
   }
 
