@@ -22,8 +22,8 @@ Supports Cinnamon 6.0 and newer.
 | Rotating the cube by dragging the desktop                     | Replaced by a hold-to-rotate shortcut: on X11 the desktop belongs to Nemo, so Cinnamon never sees those clicks |
 | Switching by pushing a dragged window against the screen edge | Done                                                                                                           |
 | Panorama (skybox) background                                  | Done, as a cached cube map instead of a shader (see below)                                                     |
-| Per-monitor perspective correction                            | Planned                                                                                                        |
-| Cube in Expo (GNOME's overview cube)                          | To be decided                                                                                                  |
+| Per-monitor perspective correction                            | Done, for every monitor at once, also on X11 (see below)                                                       |
+| Cube in Expo (GNOME's overview cube)                          | Not planned for now (see below)                                                                                |
 
 Additions that are not in the GNOME extension:
 
@@ -34,12 +34,20 @@ Additions that are not in the GNOME extension:
 | Esc while rotating with the mouse goes back to the starting workspace                                 | Done   |
 | Hiding the panels while the cube is shown                                                             | Done   |
 | Desklets are shown on the cube faces                                                                  | Done   |
+| Hot corner actions: free rotation with the mouse, rotate left, rotate right                           | Done   |
+| Zooming out automatically while the cube moves (0–30 %, default 10 %)                                 | Done   |
 
 Known limitations and open items:
 
 - Cinnamon 6.0 support is based on reading the 6.0 source; it has only been tested on newer versions so far.
 - With Blur Cinnamon, desklets are shown without their blurred background while the cube rotates, and the workspace OSD isn't integrated with Blur Cinnamon yet.
 - Tilting the cube shows the back sides of the other faces; that is expected.
+- The cube in Expo is not planned for now. Expo is the same in Cinnamon 6.0 to 6.4 and
+  barely changed in 6.6, but Cinnamon's development branch rewrites most of it, so code
+  written against today's Expo would soon need a second implementation. Cinnamon's Expo
+  is also a grid of thumbnails, unlike GNOME's single row of workspaces, so it would be a
+  redesign rather than a port. This may be revisited once the new Expo has been released.
+  Switching workspaces inside Expo keeps Cinnamon's own animation.
 
 ## Usage
 
@@ -47,6 +55,11 @@ Known limitations and open items:
 - Hold `Super+Alt+Space` (or the shortcut set in the settings), keep `Super+Alt` held and move the mouse: sideways rotates the cube, up and down tilts it, the scroll wheel zooms.
   Release the keys to switch to the workspace facing you, or press `Esc` to go back.
 - Or press the left mouse button on an empty part of any panel and move the mouse, with the same controls; release the button to switch.
+- Hot corners: in *System Settings → Hot Corners*, set a corner to *Run a command* and enter one of:
+  - `cube-free-rotate`: rotate the cube with the mouse, no button or key held. Left-click (or `Enter`) switches to the workspace facing you; right-click (or `Esc`) goes back.
+  - `cube-rotate-left` / `cube-rotate-right`: rotate to the workspace on the left / right, like `Ctrl+Alt+Left/Right`. Click the corner again to keep going.
+
+  A short hover delay (200–300 ms) on the corner helps against triggering it by accident. If the extension is disabled, Cinnamon tries to run these names as commands, which only logs an error.
 - While dragging a window, push it against the left or right screen edge to rotate to the next workspace, taking the window along.
 - The pointer is hidden while rotating with the mouse, so screen edges don't get in the way.
 - Turn off *Leave a gap between the last and first workspace* in the settings for a
@@ -59,6 +72,15 @@ GNOME Shell slides whole workspace groups during a switch, and the GNOME extensi
 
 The cube geometry (face angle, pivot distance, depth sorting, parallax) comes from the
 GNOME extension.
+
+Clutter has a single camera for the whole stage, so on a multi-monitor setup a cube on a
+monitor away from the stage center would be seen from the side. The GNOME extension fixes
+this by changing each stage view's projection, which on X11 (one stage view) only works
+for the monitor with the pointer. This port instead gives each monitor's cube a wrapper
+actor with a shear transform: seeing a scene from a camera in front of monitor M is
+exactly the same as seeing it from the stage camera S after moving each point sideways
+by `(S - M) * z / cameraDistance`. That corrects every monitor at once, also on X11, and
+Clutter's culling keeps working.
 
 The GNOME extension draws its panorama with a GLSL shader. Cinnamon's shader classes can't bind a texture of our own in any released version, so the panorama is converted once into a cube map (six faces around Clutter's camera, using the same projection as the GNOME shader) and drawn as plain textured actors. The faces are cached in `~/.cache/desktop-cube-reloaded/`, so the conversion only happens once per panorama.
 

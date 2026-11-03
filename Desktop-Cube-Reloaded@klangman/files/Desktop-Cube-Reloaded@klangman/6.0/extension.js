@@ -57,6 +57,7 @@ const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const Graphene = imports.gi.Graphene;
 const Meta = imports.gi.Meta;
+const HotCorner = imports.ui.hotCorner;
 const Main = imports.ui.main;
 const Settings = imports.ui.settings;
 
@@ -75,6 +76,19 @@ const DRAG_THRESHOLD = 8;
 // Name of the hold-to-rotate keybinding registered with Cinnamon.
 const SHORTCUT_NAME = 'desktop-cube-reloaded-rotate';
 
+// Hot corner actions. Cinnamon's hot corner settings only offer Expo, Scale, Show
+// desktop and "custom command", so the user picks "custom command" and enters one of
+// these names. We intercept them before Cinnamon would run them as a command (see
+// _patchHotCorners). They must not contain ':', the separator in the hotcorner-layout
+// setting, and must not start with a built-in action name ('expo', 'scale', 'desktop'):
+// the settings dialog saves the entry while the user types, and the moment the text is
+// exactly a built-in name it switches the corner to that action.
+const HOT_CORNER_ACTIONS = {
+  FREE_ROTATE: 'cube-free-rotate',
+  LEFT: 'cube-rotate-left',
+  RIGHT: 'cube-rotate-right',
+};
+
 // Scroll zoom, as fractions of the monitor width: per wheel click, and the limits.
 const ZOOM_STEP = 0.1;
 const MAX_ZOOM_IN = 0.3;
@@ -87,6 +101,23 @@ const AUTO_ZOOM_EDGE = 0.3;
 const AUTO_ZOOM_DRAG_DISTANCE = 150;
 
 let desktopCube = null;
+
+// Decomposes the shear x' = x + c * z (in the x-z plane) into
+//   rotation_y(angle1) * scale(scaleX, 1, scaleZ) * rotation_y(angle2)
+// using Clutter/Cogl rotation conventions, angles in degrees. This is the closed-form
+// singular value decomposition of a 2x2 matrix, here [[1, c], [0, 1]] acting on (x, z).
+function shearDecomposition(c) {
+  // E = (A00 + A11) / 2, F = (A00 - A11) / 2, G = (A10 + A01) / 2, H = (A10 - A01) / 2
+  const e = 1, f = 0, g = c / 2, h = -c / 2;
+  const q = Math.hypot(e, h);
+  const r = Math.hypot(f, g);
+  const a1 = Math.atan2(g, f);
+  const a2 = Math.atan2(h, e);
+  const theta = (a2 - a1) / 2;                     // A = Rot(phi) * diag(q + r, q - r) * Rot(theta)
+  const phi = (a2 + a1) / 2;
+  // rotation_y(t) maps (x, z) like the standard 2D rotation by -t, hence the signs.
+  return [-phi * 180 / Math.PI, q + r, q - r, -theta * 180 / Math.PI];
+}
 
 class DesktopCube {
   constructor(metadata) {
@@ -128,6 +159,7 @@ class DesktopCube {
     this._drag = new DragController(this);
     this._settings.bind('cube-shortcut', 'cubeShortcut', () => this._updateShortcut());
     this._updateShortcut();
+    this._patchHotCorners();
 
     // Remember which window the user is dragging around; it stays in front of the cube.
     this._draggedWindow = null;
@@ -153,6 +185,7 @@ class DesktopCube {
 
   disable() {
     Main.keybindingManager.removeHotKey(SHORTCUT_NAME);
+    this._unpatchHotCorners();
     this._drag.destroy();
     this._drag = null;
     this._edgeSwitch.destroy();
@@ -208,6 +241,123 @@ class DesktopCube {
         const binding = args.find(arg => arg && typeof arg.get_mask === 'function');
         this._drag.startFromShortcut(binding ? binding.get_mask() : 0);
       });
+    }
+  }
+
+  // ---------------------------------------------------------------------- hot corners
+
+  // HotCorner.runAction() handles 'expo', 'scale' and 'desktop' and runs anything else
+  // as a shell command. We wrap it on the prototype, so the corners that already exist
+  // pick it up too, and handle our own action names before they reach the shell.
+  //
+  // In Cinnamon 6.0 - 6.6 the HotCorner class is declared with `class HotCorner`, which
+  // the module doesn't export (only later versions use `var`). HotCornerManager is
+  // exported in all of them, so we take the prototype from a corner it created. If no
+  // corner is enabled yet, we wrap HotCornerManager.update(), which creates the corners
+  // whenever the hot corner settings change, and patch as soon as one exists.
+  _patchHotCorners() {
+    this._hotCornerProto = null;
+    this._origRunAction = null;
+    this._hotCornerRunAction = null;
+
+    const managerProto = HotCorner.HotCornerManager.prototype;
+    const origUpdate = managerProto.update;
+    const cube = this;
+    this._origCornerUpdate = origUpdate;
+    this._hotCornerUpdate = function (...args) {
+      const result = origUpdate.apply(this, args);
+      if (cube._hotCornerUpdate) {
+        cube._patchHotCornerPrototype(this);
+      }
+      return result;
+    };
+    managerProto.update = this._hotCornerUpdate;
+
+    this._patchHotCornerPrototype(Main.layoutManager.hotCornerManager);
+  }
+
+  // Patches runAction on the prototype of the manager's corners, once.
+  _patchHotCornerPrototype(manager) {
+    if (this._hotCornerProto || !manager || !manager.corners) {
+      return;
+    }
+    const corner = Object.values(manager.corners).find(c => c);
+    if (!corner) {
+      return;
+    }
+
+    const proto = Object.getPrototypeOf(corner);
+    const orig = proto.runAction;
+    if (typeof orig !== 'function') {
+      global.logError(`${this._meta.uuid}: hot corners have no runAction(); ` +
+                      'hot corner actions are not available');
+      return;
+    }
+
+    const cube = this;
+    this._hotCornerProto = proto;
+    this._origRunAction = orig;
+    this._hotCornerRunAction = function (timestamp) {
+      // If another extension wrapped runAction after us, we may still be called after
+      // being disabled; then just behave like Cinnamon.
+      if (cube._drag) {
+        try {
+          if (cube._runHotCornerAction(this.action, timestamp)) {
+            return;
+          }
+        } catch (e) {
+          global.logError(`${cube._meta.uuid}: hot corner action failed: ${e}\n${e.stack}`);
+          return;
+        }
+      }
+      orig.call(this, timestamp);
+    };
+    proto.runAction = this._hotCornerRunAction;
+  }
+
+  _unpatchHotCorners() {
+    const managerProto = HotCorner.HotCornerManager.prototype;
+    if (managerProto.update === this._hotCornerUpdate) {
+      managerProto.update = this._origCornerUpdate;
+    }
+    if (this._hotCornerProto && this._hotCornerProto.runAction === this._hotCornerRunAction) {
+      this._hotCornerProto.runAction = this._origRunAction;
+    }
+    this._hotCornerUpdate = null;
+    this._origCornerUpdate = null;
+    this._hotCornerProto = null;
+    this._hotCornerRunAction = null;
+    this._origRunAction = null;
+  }
+
+  // Returns true if `action` is one of ours.
+  _runHotCornerAction(action, timestamp) {
+    switch (action) {
+      case HOT_CORNER_ACTIONS.FREE_ROTATE:
+        this._drag.startFromHotCorner(timestamp);
+        return true;
+      case HOT_CORNER_ACTIONS.LEFT:
+        this._switchToNeighbor(Meta.MotionDirection.LEFT, timestamp);
+        return true;
+      case HOT_CORNER_ACTIONS.RIGHT:
+        this._switchToNeighbor(Meta.MotionDirection.RIGHT, timestamp);
+        return true;
+    }
+    return false;
+  }
+
+  // Same as Ctrl+Alt+Left/Right (Cinnamon's actionMoveWorkspaceLeft/Right), including
+  // wrapping around if "workspace-cycle" is on, but with the hot corner's timestamp:
+  // the hover activation runs from a timeout, where global.get_current_time() is 0.
+  // The switch then goes through our _switchWorkspace hook like any other.
+  _switchToNeighbor(direction, timestamp) {
+    if (Main.modalCount) {
+      return;
+    }
+    const active = global.workspace_manager.get_active_workspace();
+    const neighbor = active.get_neighbor(direction);
+    if (neighbor && neighbor !== active) {
+      neighbor.activate(timestamp || global.get_current_time());
     }
   }
 
@@ -1012,17 +1162,56 @@ class DesktopCube {
       return;
     }
     try {
-      // x' = x + a * z, y' = y + b * z, in column-major order.
-      const matrix = Clutter.Matrix.alloc();
-      matrix.init_from_array([1, 0, 0, 0,
-                              0, 1, 0, 0,
-                              a, b, 1, 0,
-                              0, 0, 0, 1]);
-      actor.set_transform(matrix);
+      actor.set_transform(this._createShearMatrix(a, b));
     } catch (e) {
       // Without the correction the cube just looks as it does with a single camera.
       global.logError(`${this._meta.uuid}: per-monitor perspective failed: ${e}`);
     }
+  }
+
+  // Returns a matrix for x' = x + a * z, y' = y + b * z, of the type that
+  // ClutterActor.set_transform() takes.
+  //
+  // In Muffin that is ClutterMatrix, a C typedef of CoglMatrix, which JavaScript sees
+  // as Cogl.Matrix. Its init_from_array() has no introspection annotation for the array,
+  // so it can't be relied on from JavaScript. Instead the shear is built from rotations
+  // and a scale, which only take plain numbers: turn its direction (a, b) onto the
+  // x axis, apply the singular value decomposition of a shear along x (a rotation, a
+  // non-uniform scale and another rotation), and turn back. The result is checked by
+  // transforming a point before it is used.
+  //
+  // Newer Mutter-based Clutter versions take a Graphene.Matrix instead, whose
+  // init_from_float() is properly annotated; that is used if Cogl.Matrix is missing.
+  _createShearMatrix(a, b) {
+    if (!Cogl.Matrix) {
+      if (Graphene.Matrix) {
+        return new Graphene.Matrix().init_from_float([1, 0, 0, 0,
+                                                      0, 1, 0, 0,
+                                                      a, b, 1, 0,
+                                                      0, 0, 0, 1]);
+      }
+      throw new Error('no matrix type available');
+    }
+
+    const amount = Math.hypot(a, b);
+    const direction = Math.atan2(b, a) * 180 / Math.PI;
+    const [angle1, scaleX, scaleZ, angle2] = shearDecomposition(amount);
+
+    const matrix = new Cogl.Matrix();
+    matrix.init_identity();
+    matrix.rotate(direction, 0, 0, 1);
+    matrix.rotate(angle1, 0, 1, 0);
+    matrix.scale(scaleX, 1, scaleZ);
+    matrix.rotate(angle2, 0, 1, 0);
+    matrix.rotate(-direction, 0, 0, 1);
+
+    // A point one unit in front of the origin must end up at (a, b, 1).
+    const [x, y, z] = matrix.transform_point(0, 0, 1, 1);
+    if (Math.abs(x - a) > 1e-3 || Math.abs(y - b) > 1e-3 || Math.abs(z - 1) > 1e-3) {
+      throw new Error(`the shear matrix came out wrong: (0, 0, 1) -> (${x}, ${y}, ${z}), ` +
+                      `expected (${a}, ${b}, 1)`);
+    }
+    return matrix;
   }
 
   // Takes the skybox out of a scene that is about to be destroyed, so it can be reused.
@@ -1750,7 +1939,7 @@ class DragController {
   constructor(cube) {
     this._cube = cube;
     this._state = DragState.INACTIVE;
-    this._source = null;       // 'panel' or 'shortcut'
+    this._source = null;       // 'panel', 'shortcut' or 'hotcorner'
     this._grabActor = null;
     this._modal = false;
 
@@ -1807,6 +1996,23 @@ class DragController {
     }
   }
 
+  // Called by the cube-free-rotate hot corner action. No button or key is held,
+  // so the mode ends with a click: left (or Enter) switches to the workspace in front,
+  // right (or Esc) goes back to where it started.
+  startFromHotCorner(time) {
+    if (this._state === DragState.ACTIVE || Main.modalCount) {
+      return;
+    }
+
+    const [x, y] = global.get_pointer();
+    this._source = 'hotcorner';
+    this._mask = 0;
+    this._grabActor = global.stage;
+    this._startX = x;
+    this._startY = y;
+    this._begin(time || global.get_current_time());
+  }
+
   _modifiersReleased() {
     if (!this._mask) {
       return false;
@@ -1857,6 +2063,7 @@ class DragController {
 
     // ACTIVE: we own all events until the drag ends.
     const shortcut = this._source === 'shortcut';
+    const hotCorner = this._source === 'hotcorner';
     if (type === Clutter.EventType.MOTION) {
       this._onDragMotion(event);
     } else if (type === Clutter.EventType.SCROLL) {
@@ -1865,7 +2072,8 @@ class DragController {
       const key = event.get_key_symbol();
       if (key === Clutter.KEY_Escape) {
         this._end(true);
-      } else if (shortcut && (key === Clutter.KEY_Return || key === Clutter.KEY_KP_Enter)) {
+      } else if ((shortcut || hotCorner) &&
+                 (key === Clutter.KEY_Return || key === Clutter.KEY_KP_Enter)) {
         this._end(false, event.get_time());
       }
     } else if (type === Clutter.EventType.KEY_RELEASE) {
@@ -1873,11 +2081,19 @@ class DragController {
         this._end(false, event.get_time());
       }
     } else if (type === Clutter.EventType.BUTTON_RELEASE) {
-      if (!shortcut) {
+      if (hotCorner) {
+        // End on the release of a press we saw, so the release can't reach whatever
+        // is under the pointer after the grab (the hot corner reacts to releases).
+        if (this._pressedButton === event.get_button()) {
+          this._end(event.get_button() === 3, event.get_time());
+        }
+      } else if (!shortcut) {
         this._end(false, event.get_time());
       }
     } else if (type === Clutter.EventType.BUTTON_PRESS) {
-      if (shortcut) {
+      if (hotCorner) {
+        this._pressedButton = event.get_button();
+      } else if (shortcut) {
         this._end(false, event.get_time());
       }
     }
@@ -1995,6 +2211,7 @@ class DragController {
     this._warpMarginY = monitor.height / 4;
 
     this._state = DragState.ACTIVE;
+    this._pressedButton = 0;
     this._totalY = 0;
     this._velocity = 0;
     this._lastTime = time;
@@ -2014,7 +2231,11 @@ class DragController {
     }
     this._modal = false;
     this._setPointerVisible(true);
-    this._warp(this._startX, this._startY);
+    // Putting the pointer back into a hot corner would trigger it again, so after a
+    // hot corner rotation it stays at the screen center.
+    if (this._source !== 'hotcorner') {
+      this._warp(this._startX, this._startY);
+    }
     Main.popModal(this._grabActor);
   }
 
