@@ -1934,6 +1934,8 @@ class EdgeSwitch {
 // and consume the events until the drag ends. During the drag the pointer is hidden
 // and kept near the screen center, so screen edges never stop the rotation.
 const DragState = {INACTIVE: 0, PENDING: 1, ACTIVE: 2};
+// Why the pointer was last warped to the center, if that warp hasn't arrived yet.
+const WarpState = {NONE: 0, BEGIN: 1, RECENTER: 2};
 
 class DragController {
   constructor(cube) {
@@ -2142,19 +2144,36 @@ class DragController {
     const [x, y] = event.get_coords();
     const time = event.get_time();
 
-    // After warping, events that were queued before the warp still report the old
-    // position. Skip everything until the warp itself arrives as a motion to the
-    // center (or, to be safe, until a short time has passed).
-    if (this._warpPending) {
+    // At the start of a drag, events queued before the first warp report positions
+    // from before the grab. Skip everything until the warp itself arrives as a motion
+    // to the center (or, to be safe, until a short time has passed).
+    if (this._warpPending === WarpState.BEGIN) {
       const arrived = Math.abs(x - this._centerX) <= 1 && Math.abs(y - this._centerY) <= 1;
       if (!arrived && time - this._warpTime < 150) {
         return;
       }
-      this._warpPending = false;
+      this._warpPending = WarpState.NONE;
       this._lastX = x;
       this._lastY = y;
       this._lastTime = time;
       return;
+    }
+
+    // While re-centering, no motion may be thrown away or the cube stalls each time
+    // the pointer is warped. Events still far from the center were queued before the
+    // warp and are measured from the old position. The first event back near the
+    // center is after the warp, and is measured from the center the pointer was
+    // moved to (the user has usually moved on a few pixels past it already).
+    if (this._warpPending === WarpState.RECENTER) {
+      if (Math.abs(x - this._centerX) <= this._warpMarginX / 2 &&
+          Math.abs(y - this._centerY) <= this._warpMarginY / 2) {
+        this._warpPending = WarpState.NONE;
+        this._lastX = this._centerX;
+        this._lastY = this._centerY;
+      } else if (time - this._warpTime > 150) {
+        // The warp seems to have been lost; try again after handling this event.
+        this._warpPending = WarpState.NONE;
+      }
     }
 
     const deltaX = x - this._lastX;
@@ -2176,10 +2195,11 @@ class DragController {
     this._lastTime = time;
     this._cube.updateDrag(deltaX, -this._totalY / height, Math.hypot(deltaX, deltaY));
 
-    if (Math.abs(x - this._centerX) > this._warpMarginX ||
-        Math.abs(y - this._centerY) > this._warpMarginY) {
+    if (this._warpPending === WarpState.NONE &&
+        (Math.abs(x - this._centerX) > this._warpMarginX ||
+         Math.abs(y - this._centerY) > this._warpMarginY)) {
       this._warp(this._centerX, this._centerY);
-      this._warpPending = true;
+      this._warpPending = WarpState.RECENTER;
       this._warpTime = time;
     }
   }
@@ -2219,7 +2239,7 @@ class DragController {
     // Hide the pointer and move it to the center; we put it back when the drag ends.
     this._setPointerVisible(false);
     this._warp(this._centerX, this._centerY);
-    this._warpPending = true;
+    this._warpPending = WarpState.BEGIN;
     this._warpTime = time;
     return true;
   }
