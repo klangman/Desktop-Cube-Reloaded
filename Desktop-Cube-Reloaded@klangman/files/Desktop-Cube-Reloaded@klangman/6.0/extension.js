@@ -15,7 +15,8 @@
 //   root (in Main.uiGroup, directly above global.window_group)
 //   |- the panorama, if any: one clone per rotating monitor (see Skybox)
 //   |- one "cube" per rotating monitor, inside a perspective wrapper (see below)
-//   |    '- one "face" per workspace: wallpaper, desktop layer (icons, desklets), windows
+//   |    '- one "face" per workspace: wallpaper, desktop layer (icons, desklets),
+//   |         panels (if they are drawn on the faces), windows
 //   |- one "static" layer per monitor that does not rotate
 //   |    (only when workspaces are on the primary monitor only)
 //   '- an overlay with windows that stay put: sticky windows and the window being
@@ -60,6 +61,7 @@ const Meta = imports.gi.Meta;
 const HotCorner = imports.ui.hotCorner;
 const Main = imports.ui.main;
 const Settings = imports.ui.settings;
+const Signals = imports.signals;
 
 // Workspaces are laid out in a single row, so vertical switches are left to Cinnamon.
 const NOOP_DIRECTIONS = [Meta.MotionDirection.UP, Meta.MotionDirection.DOWN];
@@ -119,6 +121,80 @@ function shearDecomposition(c) {
   return [-phi * 180 / Math.PI, q + r, q - r, -theta * 180 / Math.PI];
 }
 
+// Shared notifier between this extension and Blur Cinnamon, published as
+// global.desktopCubeNotifier. Whichever extension loads first creates it, and neither ever
+// removes it, so either can use it at any time, whatever the load order. Each extension only
+// clears or disconnects what it added itself.
+//   notifier.active               true while the cube scene is up (the real window group,
+//                                 desklets included, is hidden and only drawn through clones)
+//   notifier.deskletBlurProvider  set by Blur Cinnamon while it blurs desklets, else null. Its
+//                                 createDeskletBlur(deskletActor, offsetX, offsetY) returns an
+//                                 actor that draws that desklet's blurred background, already
+//                                 positioned with the offset applied, or null. The caller owns
+//                                 the returned actor and destroys it. It may rely on clips, so
+//                                 the cube only draws it inside a flat clip (createFlatClip()).
+//   notifier.panelBlurProvider    the same for panels, optional: its createPanelBlur(panel,
+//                                 offsetX, offsetY) gets a Cinnamon Panel object (not its actor)
+//                                 and follows the same rules. Used when the panels are drawn on
+//                                 the cube faces.
+// Desktop Cube emits:
+//   "cube-starting"  the scene is about to be built (desklets are still mapped)
+//   "cube-finished"  the scene was destroyed (the real window group is about to be shown)
+function getCubeNotifier() {
+  let notifier = global.desktopCubeNotifier;
+  if (!notifier || typeof notifier.connect !== 'function' || typeof notifier.emit !== 'function') {
+    notifier = {active: false, deskletBlurProvider: null, panelBlurProvider: null};
+    Signals.addSignalMethods(notifier);
+    global.desktopCubeNotifier = notifier;
+  }
+  return notifier;
+}
+
+// Returns an actor of the given size at (x, y) that draws `child` clipped to that rect.
+//
+// Clips must never be applied under the cube's 3D transform: Cogl can only scissor a clip
+// that stays an axis-aligned rectangle on screen, so a rotated one is drawn into the stencil
+// buffer instead. Stencil clipping is fragile (the wallpaper flickered or vanished on some
+// drivers, and every extra stencil clip in the scene made it worse). So the returned actor
+// is redirected offscreen: its contents, and with them the clip, are drawn flat into a
+// texture of exactly this size, and only that texture gets the 3D transform. Its own clip
+// would be applied outside that texture, so the clip is on an inner actor. Nothing inside
+// changes during a rotation, so the texture is only drawn once.
+function createFlatClip(child, x, y, width, height) {
+  const flat = new Clutter.Actor({x, y, width, height});
+  flat.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+  const clip = new Clutter.Actor({width, height, clip_to_allocation: true});
+  clip.add_child(child);
+  flat.add_child(clip);
+  return flat;
+}
+
+// True if `actor` or anything inside it clips its contents.
+function hasClips(actor) {
+  if (actor.has_clip || actor.clip_to_allocation) {
+    return true;
+  }
+  for (let child = actor.get_first_child(); child; child = child.get_next_sibling()) {
+    if (hasClips(child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns a clone of `source` for a cube face. A source with clips inside (a window blurred
+// by Blur Cinnamon, a desklet with a scrolled area, ...) would have them applied under the
+// cube's 3D transform, so its clone is redirected offscreen like createFlatClip(): the source
+// is drawn flat into a texture, which is redrawn only when the source changes. A clone has
+// no clip of its own, so no wrapper is needed.
+function createFaceClone(source, x, y) {
+  const clone = new Clutter.Clone({source, x, y});
+  if (hasClips(source)) {
+    clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+  }
+  return clone;
+}
+
 class DesktopCube {
   constructor(metadata) {
     this._meta = metadata;
@@ -133,6 +209,28 @@ class DesktopCube {
 
     // The About tab of the settings dialog shows this.
     this._settings.setValue('ext-version', this._meta.version);
+
+    // "Leave a gap between the last and first workspace" follows Cinnamon's "Allow
+    // cycling through workspaces": cycling means the workspaces wrap around, which is
+    // what a closed cube (no gap) shows. While we are enabled, any change to the
+    // Cinnamon setting is copied to ours. Changes made while we are not running are
+    // picked up when the user enables the extension (the first time, or again after
+    // disabling it). 'gap-synced' is set here and cleared in disable(), so a restart of
+    // Cinnamon or a new login, where enable() runs without a matching disable(), keeps
+    // a gap setting the user changed on our side afterwards.
+    this._muffinSettings = null;
+    this._workspaceCycleID = 0;
+    try {
+      this._muffinSettings = new Gio.Settings({ schema_id: 'org.cinnamon.muffin' });
+      this._workspaceCycleID = this._muffinSettings.connect('changed::workspace-cycle',
+                                                            () => this._syncGapSetting());
+      if (!this._settings.getValue('gap-synced')) {
+        this._syncGapSetting();
+      }
+    } catch (e) {
+      global.logError(`${this._meta.uuid}: could not read workspace-cycle: ${e}`);
+    }
+    this._settings.setValue('gap-synced', true);
 
     // _switchWorkspace normally lives on WindowManager.prototype. Cinnamon connects
     // 'switch-workspace' with an arrow function that calls this._switchWorkspace(), so
@@ -210,9 +308,28 @@ class DesktopCube {
     this._hook = null;
     this._origSwitch = null;
 
+    if (this._muffinSettings) {
+      if (this._workspaceCycleID) {
+        this._muffinSettings.disconnect(this._workspaceCycleID);
+      }
+      this._workspaceCycleID = 0;
+      this._muffinSettings = null;
+    }
+
     if (this._settings) {
+      // Sync the gap setting again the next time the extension is enabled.
+      this._settings.setValue('gap-synced', false);
       this._settings.finalize();
       this._settings = null;
+    }
+  }
+
+  // Copies Cinnamon's "Allow cycling through workspaces" to our gap setting (inverted).
+  // Only the next rotation uses the new value; a cube shown right now is not changed.
+  _syncGapSetting() {
+    const gap = !this._muffinSettings.get_boolean('workspace-cycle');
+    if (this._settings.getValue('last-first-gap') !== gap) {
+      this._settings.setValue('last-first-gap', gap);
     }
   }
 
@@ -712,6 +829,14 @@ class DesktopCube {
         anim.root.destroy();
       }
     });
+    // All clones are gone; tell Blur Cinnamon before the real desklets come back.
+    if (anim.cubeNotified) {
+      step(() => {
+        const notifier = getCubeNotifier();
+        notifier.active = false;
+        notifier.emit('cube-finished');
+      });
+    }
     step(() => global.window_group.show());
     step(() => {
       if (anim.unredirectDisabled) {
@@ -735,6 +860,16 @@ class DesktopCube {
     // Same check Cinnamon uses for its workspace OSD.
     const onlyPrimary = Main.wm.wm_settings.get_boolean('workspaces-only-on-primary');
     const isRotating = (index) => !onlyPrimary || index === primary;
+
+    // Let Blur Cinnamon know before anything is cloned or hidden.
+    const notifier = getCubeNotifier();
+    notifier.active = true;
+    anim.cubeNotified = true;
+    try {
+      notifier.emit('cube-starting');
+    } catch (e) {
+      global.logError(`${this._meta.uuid}: cube-starting handler failed: ${e}`);
+    }
 
     const root = new Clutter.Actor({
       name: 'desktop-cube-reloaded',
@@ -830,11 +965,10 @@ class DesktopCube {
       const isDesktop = type === Meta.WindowType.DESKTOP;
       const addTo = (face, offsetX, offsetY) => {
         const parent = isDesktop ? face._desktop : face._windows;
-        parent.add_child(new Clutter.Clone({
-          source: actor,
-          x: actor.x - offsetX,
-          y: actor.y - offsetY,
-        }));
+        parent.add_child(createFaceClone(actor, actor.x - offsetX, actor.y - offsetY));
+        if (!isDesktop) {
+          face._topWindow = window;
+        }
       };
 
       // On a static monitor everything simply stays where it is.
@@ -876,28 +1010,64 @@ class DesktopCube {
     // still mapped.
     //
     // Blur Cinnamon puts its blurred desklet backgrounds into the same container
-    // (tagged with _blurCinnamonName). Their blur samples the screen behind them, which
-    // doesn't work on a rotated copy and shows up as a large box, so we leave them out.
-    // During the rotation the desklets are therefore drawn without blur.
+    // (tagged with _blurCinnamonName). They are full screen actors clipped to the desklet,
+    // and some are only drawn through a separate viewport actor, so cloning them like the
+    // desklets doesn't work. They are left out here, and Blur Cinnamon instead hands us a
+    // ready-to-use actor for each desklet's blur through the shared notifier (see
+    // getCubeNotifier()), which goes right below that desklet's clone.
     const container = global.desklet_container;
     const desklets = (container && global.window_group.contains(container)) ?
       container.get_children().filter(d => d.visible && d._blurCinnamonName === undefined) :
       [];
     const deskletPositions = desklets.map(d => d.get_transformed_position());
+    // Each desklet belongs to the monitor its center is on. Only that monitor's faces get a
+    // copy: on any other monitor it would sit outside the face and float beside the cube.
+    const deskletMonitors = desklets.map((desklet, k) => {
+      const [x, y] = deskletPositions[k];
+      const cx = x + desklet.width / 2;
+      const cy = y + desklet.height / 2;
+      const index = monitors.findIndex(m => cx >= m.x && cx < m.x + m.width &&
+                                            cy >= m.y && cy < m.y + m.height);
+      return index >= 0 ? index : primary;
+    });
+    const blurProvider = notifier.deskletBlurProvider;
+    const createDeskletBlur = (desklet, offsetX, offsetY) => {
+      if (!blurProvider || typeof blurProvider.createDeskletBlur !== 'function') {
+        return null;
+      }
+      try {
+        return blurProvider.createDeskletBlur(desklet, offsetX, offsetY);
+      } catch (e) {
+        global.logError(`${this._meta.uuid}: Blur Cinnamon desklet blur failed: ${e}`);
+        return null;
+      }
+    };
 
     layers.forEach((layer, index) => {
       const monitor = monitors[index];
       layer.faces.forEach(face => {
         desklets.forEach((desklet, k) => {
+          if (deskletMonitors[k] !== index) {
+            return;
+          }
           const [x, y] = deskletPositions[k];
-          face._desktop.add_child(new Clutter.Clone({
-            source: desklet,
-            x: x - monitor.x,
-            y: y - monitor.y,
-          }));
+          // Blur Cinnamon clips its blur to the desklet's rect, so draw it flat (see
+          // createFlatClip()) with the clip done inside, at the desklet's place on the face.
+          const blur = createDeskletBlur(desklet, x, y);
+          if (blur) {
+            face._desktop.add_child(createFlatClip(blur, x - monitor.x, y - monitor.y,
+                                                   Math.ceil(desklet.width),
+                                                   Math.ceil(desklet.height)));
+          }
+          face._desktop.add_child(createFaceClone(desklet, x - monitor.x, y - monitor.y));
         });
       });
     });
+
+    const panelMode = this._settings.getValue('panel-mode');
+    if (panelMode === 'faces') {
+      this._addPanelClones(layers, notifier);
+    }
 
     // Remember each clone's place in the stacking order. The children get reordered
     // for depth sorting later, but the topmost window must stay closest to the viewer.
@@ -914,9 +1084,10 @@ class DesktopCube {
     //
     // To hide the panels, we don't touch them at all: fading them out made parts of
     // the cube flicker. Instead the cube goes above them, on a black backdrop that
-    // covers each monitor where it rotates.
+    // covers each monitor where it rotates. Panels drawn on the faces are hidden the
+    // same way, so only their clones show.
     let below = global.window_group;
-    if (this._settings.getValue('hide-panels')) {
+    if (panelMode === 'hide' || panelMode === 'faces') {
       anim.cubes.slice().reverse().forEach(cube => {
         const m = cube.monitor;
         root.insert_child_at_index(new Clutter.Actor({
@@ -930,6 +1101,89 @@ class DesktopCube {
     Meta.disable_unredirect_for_display(global.display);
     anim.unredirectDisabled = true;
     global.window_group.hide();
+  }
+
+  // Gives every face a clone of each panel on its monitor, like the desklets. Panels are
+  // on all workspaces, so every face shows the same live panel: applets that depend on
+  // the workspace (a window list showing only the current workspace's windows, the
+  // workspace switcher) show the current state on every face.
+  //
+  // Cinnamon hides the panels of a monitor whose topmost window is fullscreen. The real
+  // panel is then hidden, but a clone still draws its source, so we leave the clone out
+  // on exactly those faces and keep it on the others.
+  _addPanelClones(layers, notifier) {
+    if (!Main.panelManager) {
+      return;
+    }
+    const monitors = Main.layoutManager.monitors;
+    const blurProvider = notifier.panelBlurProvider;
+    const createPanelBlur = (panel, offsetX, offsetY) => {
+      if (!blurProvider || typeof blurProvider.createPanelBlur !== 'function') {
+        return null;
+      }
+      try {
+        return blurProvider.createPanelBlur(panel, offsetX, offsetY);
+      } catch (e) {
+        global.logError(`${this._meta.uuid}: Blur Cinnamon panel blur failed: ${e}`);
+        return null;
+      }
+    };
+
+    Main.panelManager.getPanels().forEach(panel => {
+      const actor = panel ? panel.actor : null;
+      // Disabled panels (e.g. while panels are being edited) stay hidden. Some extensions
+      // (Centered Cinnamon Dock) hide a panel by fading or scaling it to nothing; a clone
+      // ignores its source's opacity and scale, so check those by hand.
+      if (!actor || panel._disabled || actor.opacity === 0 ||
+          actor.scale_x === 0 || actor.scale_y === 0) {
+        return;
+      }
+      const layer = layers[panel.monitorIndex];
+      const monitor = monitors[panel.monitorIndex];
+      if (!layer || !monitor) {
+        return;
+      }
+      // The panel's real size is its allocation. actor.width/height are not reliable here:
+      // while a relayout is pending (Blur Cinnamon re-applying its custom CSS, an applet
+      // updating, ...) they return the preferred size instead, and with CSS margins that
+      // is the full monitor, because Cinnamon makes the panel shorter by the margins and
+      // Clutter adds them back to the preferred size. Clutter.Clone stretches its source to
+      // the clone's size, so the panel would come out stretched. get_allocation_box() runs
+      // the pending relayout first, so the size and position are current.
+      const box = actor.get_allocation_box();
+      const width = box.x2 - box.x1;
+      const height = box.y2 - box.y1;
+      const [x, y] = actor.get_transformed_position();
+      // Clip the panel and its blur to the monitor, like the real screen does, in case a
+      // panel sticks out (e.g. while it slides in or out). The clip is done flat (see
+      // createFlatClip()), never under the cube's 3D transform.
+      const x1 = Math.max(x, monitor.x);
+      const y1 = Math.max(y, monitor.y);
+      const visibleWidth = Math.ceil(Math.min(x + width, monitor.x + monitor.width) - x1);
+      const visibleHeight = Math.ceil(Math.min(y + height, monitor.y + monitor.height) - y1);
+      if (visibleWidth <= 0 || visibleHeight <= 0) {
+        return;
+      }
+      layer.faces.forEach(face => {
+        if (face._topWindow && face._topWindow.is_fullscreen()) {
+          return;
+        }
+        // A blurred panel's background goes right below it, drawn flat like a desklet's.
+        const blur = createPanelBlur(panel, x1, y1);
+        if (blur) {
+          const flat = createFlatClip(blur, x1 - monitor.x, y1 - monitor.y,
+                                      visibleWidth, visibleHeight);
+          flat.opacity = actor.opacity;
+          face._panels.add_child(flat);
+        }
+        // The clone gets the panel's allocated size, so it isn't stretched (see above).
+        const clone = new Clutter.Clone({source: actor, x: x - x1, y: y - y1, width, height});
+        const flat = createFlatClip(clone, x1 - monitor.x, y1 - monitor.y,
+                                    visibleWidth, visibleHeight);
+        flat.opacity = actor.opacity;
+        face._panels.add_child(flat);
+      });
+    });
   }
 
   // Returns the panel actor that is highest in Main.uiGroup, or null.
@@ -954,16 +1208,11 @@ class DesktopCube {
   _createFace(monitor) {
     const face = new Clutter.Actor({width: monitor.width, height: monitor.height});
 
-    const backgroundHolder = new Clutter.Actor({
-      width: monitor.width,
-      height: monitor.height,
-      clip_to_allocation: true,
-    });
-    const background = this._createBackground();
-    if (background) {
-      background.set_position(-monitor.x, -monitor.y);
-      backgroundHolder.add_child(background);
-    }
+    // The wallpaper actor covers the whole screen, so it is clipped to this monitor. The
+    // clip is done flat (see createFlatClip()), never under the cube's 3D transform.
+    const background = this._createBackground() || new Clutter.Actor();
+    background.set_position(-monitor.x, -monitor.y);
+    const backgroundHolder = createFlatClip(background, 0, 0, monitor.width, monitor.height);
     face.add_child(backgroundHolder);
     face._background = backgroundHolder;
 
@@ -971,9 +1220,18 @@ class DesktopCube {
     face._desktop = new Clutter.Actor();
     face.add_child(face._desktop);
 
+    // Panels, if they are drawn on the faces: also flat on the wallpaper, above the
+    // desklets. With no depth buffer, paint order is depth order, so they are painted
+    // before the windows, which float in front of them while the cube rotates. The real
+    // panels are above the windows, but windows rarely overlap a panel, and only a window
+    // that does would show above it when the cube is at rest.
+    face._panels = new Clutter.Actor();
+    face.add_child(face._panels);
+
     // Windows: these float in front of the face while the cube rotates.
     face._windows = new Clutter.Actor();
     face.add_child(face._windows);
+    face._topWindow = null;
     face._frontFacing = true;
 
     return face;
@@ -1915,15 +2173,19 @@ class EdgeSwitch {
 // movement tilts, and the scroll wheel zooms. There are two ways to start:
 //
 //   panel     Drag an empty part of any panel with the left mouse button. Releasing
-//             the button snaps to the workspace in front.
+//             the button snaps to the workspace in front; clicking the right button
+//             while dragging goes back to the workspace the drag started on.
 //   shortcut  Hold the shortcut (Super+Alt+Space by default) and move the mouse, no
-//             button needed. Releasing the shortcut's modifier keys, a click, or Enter
-//             snaps to the workspace in front. This works anywhere, including over the
+//             button needed. Releasing the shortcut's modifier keys, a left click, or
+//             Enter snaps to the workspace in front; a right click goes back. This works anywhere, including over the
 //             desktop, whose clicks go to Nemo and never reach Cinnamon. It is modeled
 //             on Cinnamon's Alt+Tab switcher, which also ends when the modifiers are
 //             released.
 //
-// In both cases Esc goes back to the workspace the drag started on.
+//   hotcorner The cube-free-rotate hot corner action. A left click or Enter snaps
+//             to the workspace in front; a right click goes back.
+//
+// In every case a right click or Esc goes back to the workspace the drag started on.
 //
 // This plays the role of DragGesture.js in the GNOME extension. GNOME feeds the drag
 // into its SwipeTracker; Cinnamon has none, so we drive the cube directly.
@@ -1944,6 +2206,10 @@ class DragController {
     this._source = null;       // 'panel', 'shortcut' or 'hotcorner'
     this._grabActor = null;
     this._modal = false;
+    // Mouse buttons (as Clutter.ModifierType masks) whose press we consumed but whose
+    // release came after the drag ended. Those releases are swallowed too, so they
+    // can't reach the panel or whatever else is under the pointer.
+    this._swallowMask = 0;
 
     // An error here must never leave the modal grab in place, or the desktop stops
     // responding. So any error ends the drag and removes the cube.
@@ -2035,6 +2301,19 @@ class DragController {
     const type = event.type();
 
     if (this._state === DragState.INACTIVE) {
+      if (this._swallowMask) {
+        if (type === Clutter.EventType.BUTTON_RELEASE) {
+          const mask = this._buttonMask(event.get_button());
+          if (this._swallowMask & mask) {
+            this._swallowMask &= ~mask;
+            return Clutter.EVENT_STOP;
+          }
+        } else if (type === Clutter.EventType.BUTTON_PRESS ||
+                   type === Clutter.EventType.MOTION) {
+          // Forget releases we must have missed.
+          this._swallowMask &= event.get_state();
+        }
+      }
       if (type === Clutter.EventType.BUTTON_PRESS && event.get_button() === 1 &&
           !Main.modalCount && this._cube._settings.getValue('enable-panel-dragging') &&
           this._panelForActor(event.get_source())) {
@@ -2096,15 +2375,35 @@ class DragController {
       if (hotCorner) {
         this._pressedButton = event.get_button();
       } else if (shortcut) {
-        this._end(false, event.get_time());
+        // A right click goes back to where it started; any other click snaps to the
+        // workspace in front. Either way the button's release is swallowed.
+        const button = event.get_button();
+        this._end(button === 3, event.get_time(), this._buttonMask(button));
+      } else if (event.get_button() === 3) {
+        // A right click during a panel drag goes back to where it started, as it
+        // does for the hot corner and the shortcut. The left button is usually still
+        // held; both releases are swallowed once the drag has ended.
+        this._end(true, event.get_time(), this._buttonMask(3));
       }
     }
     return Clutter.EVENT_STOP;
   }
 
+  _buttonMask(button) {
+    return button >= 1 && button <= 5 ? Clutter.ModifierType.BUTTON1_MASK << (button - 1) : 0;
+  }
+
   // Ends the drag: snap to the workspace in front (throwing the cube if the mouse was
   // still moving), or go back to where the drag started if cancelled.
-  _end(cancelled, time = 0) {
+  // `pressedMask` adds buttons whose press is being handled right now and so isn't in
+  // the pointer state yet. Any buttons still held have their releases swallowed.
+  _end(cancelled, time = 0, pressedMask = 0) {
+    const allButtons = Clutter.ModifierType.BUTTON1_MASK | Clutter.ModifierType.BUTTON2_MASK |
+      Clutter.ModifierType.BUTTON3_MASK | Clutter.ModifierType.BUTTON4_MASK |
+      Clutter.ModifierType.BUTTON5_MASK;
+    const [, , mods] = global.get_pointer();
+    this._swallowMask = (mods | pressedMask) & allButtons;
+
     this._ungrab();
     this._state = DragState.INACTIVE;
 

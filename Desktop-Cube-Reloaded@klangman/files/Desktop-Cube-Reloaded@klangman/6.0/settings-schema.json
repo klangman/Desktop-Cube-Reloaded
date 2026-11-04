@@ -9,7 +9,7 @@
         ],
         "switching-page": {
             "type": "page",
-            "title": "Switching",
+            "title": "General",
             "sections": [
                 "animation-section",
                 "edge-section"
@@ -17,13 +17,13 @@
         },
         "animation-section": {
             "type": "section",
-            "title": "Workspace switch animation",
+            "title": "Cube",
             "keys": [
                 "animation-time",
                 "last-first-gap",
                 "window-parallax",
                 "auto-zoom-out",
-                "hide-panels",
+                "panel-mode",
                 "per-monitor-perspective"
             ]
         },
@@ -112,7 +112,7 @@
         "type": "switch",
         "default": true,
         "description": "Leave a gap between the last and first workspace",
-        "tooltip": "When enabled, the workspaces cover only half a circle, so switching from the last to the first workspace rotates back through all of them. When disabled, the workspaces form a closed cube and wrapping around takes the shortest way."
+        "tooltip": "When enabled, the workspaces cover only half a circle, so switching from the last to the first workspace rotates back through all of them. When disabled, the workspaces form a closed cube and wrapping around takes the shortest way.\n\nThis option is linked to Cinnamon's \"Allow cycling through workspaces\" setting (System Settings > Workspaces): turning cycling on turns this gap off, and turning cycling off turns the gap on. You can still change this option here, but the next change to the Cinnamon setting will override it, and so will disabling and re-enabling this extension."
     },
     "window-parallax": {
         "type": "custom",
@@ -138,11 +138,16 @@
         "tooltip": "While the cube rotates, it moves back until it looks this much smaller than the screen, then comes forward again as it stops. When you rotate the cube with the mouse, it zooms out as you start moving the mouse. 0 turns it off.",
         "digits": 0
     },
-    "hide-panels": {
-        "type": "switch",
-        "default": false,
-        "description": "Hide the panels while the cube is shown",
-        "tooltip": "Draws the cube above the panels on the monitors where it rotates, during workspace switches and while dragging the cube. The panels themselves are not changed."
+    "panel-mode": {
+        "type": "combobox",
+        "default": "faces",
+        "description": "Panels while the cube is shown",
+        "options": {
+            "On the cube faces": "faces",
+            "Above the cube": "above",
+            "Hidden": "hide"
+        },
+        "tooltip": "On the cube faces: every face shows the panels of its monitor, which turn with the cube. Above the cube: the panels stay where they are and the cube turns behind them. Hidden: the cube is drawn above the panels. The panels themselves are not changed."
     },
     "per-monitor-perspective": {
         "type": "switch",
@@ -228,11 +233,15 @@
         "type": "generic",
         "default": ""
     },
+    "gap-synced": {
+        "type": "generic",
+        "default": false
+    },
     "about-text": {
         "type": "custom",
         "file": "CustomWidgets.py",
         "widget": "About",
-        "description": "\n<b>Your workspaces, on a cube</b>\nVersion: ext-version\n\nDeveloped by: Kevin Langman and <a href=\"https://github.com/klangman/Desktop-Cube-Reloaded/graphs/contributors\">contributors</a>\n<a href=\"https://github.com/klangman/Desktop-Cube-Reloaded\">Github</a> / <a href=\"https://github.com/klangman/Desktop-Cube-Reloaded/issues/new\">Report an issue</a>\n\nA port of the GNOME Shell extension <a href=\"https://github.com/Schneegans/Desktop-Cube\">Desktop Cube</a>\nby Simon Schneegans (<a href=\"https://ko-fi.com/schneegans\">Ko-fi</a> / <a href=\"https://github.com/sponsors/Schneegans\">GitHub Sponsors</a>)\n\nThe icon is by Simon Schneegans, licensed under <a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>",
+        "description": "\n<b>Your workspaces, on a cube</b>\nVersion: ext-version\n\nDeveloped by: Kevin Langman\n<a href=\"https://github.com/klangman/Desktop-Cube-Reloaded\">Github</a> / <a href=\"https://github.com/klangman/Desktop-Cube-Reloaded/issues/new\">Report an issue</a>\n\nA port of the GNOME Shell extension <a href=\"https://github.com/Schneegans/Desktop-Cube\">Desktop Cube</a>\nby Simon Schneegans (<a href=\"https://ko-fi.com/schneegans\">Ko-fi</a> / <a href=\"https://github.com/sponsors/Schneegans\">GitHub Sponsors</a>)\n\nThe icon is by Simon Schneegans, licensed under <a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>",
         "icon": "/icon.png"
     }
 }

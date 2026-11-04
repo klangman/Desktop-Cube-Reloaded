@@ -32,7 +32,7 @@ Additions that are not in the GNOME extension:
 | Hold a shortcut (default `Super+Alt+Space`) to rotate the cube with the mouse, anywhere on the screen | Done   |
 | Zooming with the scroll wheel while rotating with the mouse                                           | Done   |
 | Esc while rotating with the mouse goes back to the starting workspace                                 | Done   |
-| Hiding the panels while the cube is shown                                                             | Done   |
+| Panels drawn on the cube faces (default), above the cube, or hidden while the cube is shown          | Done   |
 | Desklets are shown on the cube faces                                                                  | Done   |
 | Hot corner actions: free rotation with the mouse, rotate left, rotate right                           | Done   |
 | Zooming out automatically while the cube moves (0–30 %, default 10 %)                                 | Done   |
@@ -41,6 +41,7 @@ Known limitations and open items:
 
 - Cinnamon 6.0 support is based on reading the 6.0 source; it has only been tested on newer versions so far.
 - With Blur Cinnamon, desklets are shown without their blurred background while the cube rotates, and the workspace OSD isn't integrated with Blur Cinnamon yet.
+- Panels on the cube faces are live copies of the real panels, so every face shows the same panel: a window list that only shows the current workspace, or the workspace switcher, shows the current workspace's state on every face. With Blur Cinnamon, a panel's blur is missing on the other faces while a fullscreen window hides that panel on the current one.
 - Tilting the cube shows the back sides of the other faces; that is expected.
 - The cube in Expo is not planned for now. Expo is the same in Cinnamon 6.0 to 6.4 and
   barely changed in 6.6, but Cinnamon's development branch rewrites most of it, so code
@@ -53,8 +54,8 @@ Known limitations and open items:
 
 - Switch workspaces as usual (e.g. `Ctrl+Alt+Left/Right`) and the cube rotates.
 - Hold `Super+Alt+Space` (or the shortcut set in the settings), keep `Super+Alt` held and move the mouse: sideways rotates the cube, up and down tilts it, the scroll wheel zooms.
-  Release the keys to switch to the workspace facing you, or press `Esc` to go back.
-- Or press the left mouse button on an empty part of any panel and move the mouse, with the same controls; release the button to switch.
+  Release the keys (or left-click) to switch to the workspace facing you; right-click (or `Esc`) goes back.
+- Or press the left mouse button on an empty part of any panel and move the mouse, with the same controls; release the button to switch, or right-click (or `Esc`) to go back.
 - Hot corners: in *System Settings → Hot Corners*, set a corner to *Run a command* and enter one of:
   - `cube-free-rotate`: rotate the cube with the mouse, no button or key held. Left-click (or `Enter`) switches to the workspace facing you; right-click (or `Esc`) goes back.
   - `cube-rotate-left` / `cube-rotate-right`: rotate to the workspace on the left / right, like `Ctrl+Alt+Left/Right`. Click the corner again to keep going.
