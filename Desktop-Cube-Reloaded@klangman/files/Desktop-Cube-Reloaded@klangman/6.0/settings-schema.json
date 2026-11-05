@@ -5,14 +5,15 @@
             "switching-page",
             "background-page",
             "rotating-page",
+            "edge-page",
+            "hot-corner-page",
             "about-page"
         ],
         "switching-page": {
             "type": "page",
             "title": "General",
             "sections": [
-                "animation-section",
-                "edge-section"
+                "animation-section"
             ]
         },
         "animation-section": {
@@ -24,15 +25,20 @@
                 "window-parallax",
                 "auto-zoom-out",
                 "panel-mode",
-                "per-monitor-perspective"
+                "per-monitor-perspective",
+                "open-workspace-settings"
             ]
         },
-        "edge-section": {
+        "hot-corner-section": {
             "type": "section",
-            "title": "Switching at the screen edge",
+            "title": "Hot corners",
             "keys": [
-                "enable-edge-switch",
-                "edge-switch-pressure"
+                "hot-corner-top-left",
+                "hot-corner-top-right",
+                "hot-corner-bottom-left",
+                "hot-corner-bottom-right",
+                "hot-corner-info",
+                "open-hot-corner-settings"
             ]
         },
         "background-page": {
@@ -83,6 +89,13 @@
                 "rotating-info"
             ]
         },
+        "hot-corner-page": {
+            "type": "page",
+            "title": "Hot Corners",
+            "sections": [
+                "hot-corner-section"
+            ]
+        },
         "about-page": {
             "type": "page",
             "title": "About",
@@ -95,6 +108,40 @@
             "title": "About Desktop Cube Reloaded",
             "keys": [
                 "about-text"
+            ]
+        },
+        "edge-window-section": {
+            "type": "section",
+            "title": "Pushing a dragged window",
+            "keys": [
+                "enable-edge-switch",
+                "edge-switch-pressure"
+            ]
+        },
+        "edge-push-section": {
+            "type": "section",
+            "title": "Pushing the mouse",
+            "keys": [
+                "enable-edge-push",
+                "edge-push-action",
+                "edge-push-pressure",
+                "edge-push-modifier"
+            ]
+        },
+        "edge-peek-section": {
+            "type": "section",
+            "title": "Cube preview while pushing",
+            "keys": [
+                "edge-peek"
+            ]
+        },
+        "edge-page": {
+            "type": "page",
+            "title": "Screen Edges",
+            "sections": [
+                "edge-window-section",
+                "edge-push-section",
+                "edge-peek-section"
             ]
         }
     },
@@ -172,6 +219,57 @@
         "dependency": "enable-edge-switch",
         "tooltip": "How far you have to push the mouse into the screen edge, within one second, before the workspace switches. Higher values make it less likely to switch by accident, for example when you only want to tile the window."
     },
+    "enable-edge-push": {
+        "type": "switch",
+        "default": false,
+        "description": "Switch workspaces by pushing the mouse against the screen edge",
+        "tooltip": "Push the mouse pointer against the left or right edge of the screen to rotate to the next workspace. Edges between two monitors don't count."
+    },
+    "edge-push-action": {
+        "type": "combobox",
+        "default": "switch",
+        "description": "Action",
+        "dependency": "enable-edge-push",
+        "options": {
+            "Switch to the next workspace": "switch",
+            "Start free rotation": "free-rotate"
+        },
+        "tooltip": "Free rotation lets you turn the cube with the mouse, like the free rotation hot corner action. Left click or Enter switches to the workspace in front, right click or Esc goes back."
+    },
+    "edge-push-pressure": {
+        "type": "spinbutton",
+        "default": 400,
+        "min": 50,
+        "max": 3000,
+        "step": 10,
+        "units": "pixels",
+        "description": "Edge push pressure",
+        "dependency": "enable-edge-push",
+        "tooltip": "How hard you have to push the mouse into the screen edge before the workspace switches. Higher values make accidental switches less likely."
+    },
+    "edge-push-modifier": {
+        "type": "combobox",
+        "default": "none",
+        "description": "Only while holding",
+        "dependency": "enable-edge-push",
+        "options": {
+            "No key": "none",
+            "Ctrl": "ctrl",
+            "Alt": "alt",
+            "Shift": "shift"
+        },
+        "tooltip": "Only switch when this key is held while pushing against the edge."
+    },
+    "edge-peek": {
+        "type": "spinbutton",
+        "default": 5,
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "units": "%",
+        "description": "Turn the cube while pushing",
+        "tooltip": "How far the cube turns towards the next workspace while you push, before it commits. 0 switches without a preview."
+    },
     "enable-panorama": {
         "type": "switch",
         "default": false,
@@ -228,6 +326,67 @@
         "widget": "LabelWithTooltip",
         "description": "💡 Controls while rotating (see tooltip)",
         "tooltip": "<b>Move sideways:</b> rotate the cube\n<b>Move up or down:</b> tilt the cube\n<b>Scroll wheel:</b> zoom in and out\n<b>Esc:</b> go back to the workspace you started on\n\nWhen you release the shortcut's keys (or the mouse button, when dragging a panel), the cube switches to the workspace facing you. If the mouse is still moving, the cube keeps turning a little in that direction."
+    },
+    "hot-corner-top-left": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "HotCornerChooser",
+        "corner": 0,
+        "default": "",
+        "description": "Top left corner",
+        "tooltip": "Pick a cube action to trigger it by pushing the mouse into this corner of the screen.\n\nIf Cinnamon already uses the corner for something else, that action is kept as the first item of this list: pick it again to put the corner back the way it was.\n\nThe hover delay and whether corners work over fullscreen windows are set in <i>System Settings → Hot Corners</i>."
+    },
+    "hot-corner-top-right": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "HotCornerChooser",
+        "corner": 1,
+        "default": "",
+        "description": "Top right corner",
+        "tooltip": "Pick a cube action to trigger it by pushing the mouse into this corner of the screen.\n\nIf Cinnamon already uses the corner for something else, that action is kept as the first item of this list: pick it again to put the corner back the way it was.\n\nThe hover delay and whether corners work over fullscreen windows are set in <i>System Settings → Hot Corners</i>."
+    },
+    "hot-corner-bottom-left": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "HotCornerChooser",
+        "corner": 2,
+        "default": "",
+        "description": "Bottom left corner",
+        "tooltip": "Pick a cube action to trigger it by pushing the mouse into this corner of the screen.\n\nIf Cinnamon already uses the corner for something else, that action is kept as the first item of this list: pick it again to put the corner back the way it was.\n\nThe hover delay and whether corners work over fullscreen windows are set in <i>System Settings → Hot Corners</i>."
+    },
+    "hot-corner-bottom-right": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "HotCornerChooser",
+        "corner": 3,
+        "default": "",
+        "description": "Bottom right corner",
+        "tooltip": "Pick a cube action to trigger it by pushing the mouse into this corner of the screen.\n\nIf Cinnamon already uses the corner for something else, that action is kept as the first item of this list: pick it again to put the corner back the way it was.\n\nThe hover delay and whether corners work over fullscreen windows are set in <i>System Settings → Hot Corners</i>."
+    },
+    "hot-corner-info": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "LabelWithTooltip",
+        "description": "💡 What the cube actions do (see tooltip)",
+        "tooltip": "<b>Rotate with the mouse:</b> move the mouse to turn the cube, no button or key held. Left-click (or Enter) switches to the workspace facing you; right-click (or Esc) goes back.\n\n<b>Rotate left / right:</b> switch to the workspace on the left / right, like Ctrl+Alt+Left/Right. Left-click in the corner to keep going.\n\nThese are the same corners as in <i>System Settings → Hot Corners</i>, where they show up as commands named cube-free-rotate, cube-rotate-left and cube-rotate-right. If this extension is turned off, those corners do nothing."
+    },
+    "open-workspace-settings": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "SettingsLauncher",
+        "module": "workspaces",
+        "description": "Cinnamon workspace settings",
+        "button": "Open Workspaces",
+        "tooltip": "Opens <i>System Settings → Workspaces</i>, where you can turn on \"Allow cycling through workspaces\" (linked to the gap option above) and change the workspace OSD."
+    },
+    "open-hot-corner-settings": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "SettingsLauncher",
+        "module": "hotcorner",
+        "description": "Cinnamon hot corner settings",
+        "button": "Open Hot Corners",
+        "tooltip": "Opens <i>System Settings → Hot Corners</i>, where you can set the hover delay of each corner and whether it works over fullscreen windows."
     },
     "ext-version": {
         "type": "generic",

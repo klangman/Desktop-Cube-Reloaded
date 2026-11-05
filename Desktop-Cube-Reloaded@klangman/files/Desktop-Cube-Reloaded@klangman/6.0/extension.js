@@ -48,8 +48,8 @@
 // a wrapper actor with that shear as its transform. The shear also maps camera M onto
 // camera S, so the depth sorting below keeps working with the stage camera.
 //
-// Pushing a window that is being dragged against the left or right screen edge
-// switches to the next workspace and takes the window along (see EdgeSwitch).
+// Pushing the pointer against an outer left or right screen edge switches to the next
+// workspace, taking a dragged window along, or starts free rotation (see EdgeSwitch).
 
 const Clutter = imports.gi.Clutter;
 const Cogl = imports.gi.Cogl;
@@ -273,6 +273,10 @@ class DesktopCube {
     });
 
     this._edgeSwitch = new EdgeSwitch(this);
+    this._settings.bind('enable-edge-switch', 'enableEdgeSwitch',
+                        () => this._edgeSwitch && this._edgeSwitch.update(true));
+    this._settings.bind('enable-edge-push', 'enableEdgePush',
+                        () => this._edgeSwitch && this._edgeSwitch.update(true));
 
     this._skybox = null;
     this._settings.bind('enable-panorama', 'enablePanorama', () => this._updateSkybox());
@@ -645,6 +649,37 @@ class DesktopCube {
     const duration = Math.max(this._settings.getValue('animation-time'),
                               500 * Math.abs(anim.pitch));
     this._animateTo(target, duration);
+  }
+
+  // Edge push: the cube is held in drag mode without a modal grab, so the user keeps
+  // working normally; _switchWorkspace absorbs switches as it does during a drag.
+  beginPeek() {
+    return this.beginDrag();
+  }
+
+  // offset in workspaces, signed (positive = to the right).
+  updatePeek(offset) {
+    const anim = this._anim;
+    if (!anim || anim.mode !== 'drag') {
+      return;
+    }
+    anim.progress = this._clampProgress(anim.dragStartProgress + offset);
+    // A light zoom-out that grows with the peek, like the one during a mouse rotation.
+    const start = anim.dragAutoZoomStart;
+    anim.autoZoom = start + (1 - start) * Math.min(1, Math.abs(offset) / 0.25);
+    this._updateCubes();
+  }
+
+  commitPeek(direction) {
+    const anim = this._anim;
+    if (!anim || anim.mode !== 'drag') {
+      return;
+    }
+    const target = this._clampProgress(anim.dragStartProgress + direction);
+    anim.mode = 'settle';
+    // Only the rest of the turn is left, so take proportionally less time.
+    this._animateTo(target, this._settings.getValue('animation-time') *
+                    Math.abs(target - anim.progress));
   }
 
   _clampProgress(progress) {
@@ -1269,6 +1304,8 @@ class DesktopCube {
       this._skybox.setRotation(progress, pitch, anim.nWorkspaces);
     }
 
+    const faceOpacity = Math.round(255 * (1.0 - Math.abs(pitch)));
+
     anim.cubes.forEach(cube => {
       const monitor = cube.monitor;
       const centerDepth = this._getCenterDist(monitor.width, faceAngle);
@@ -1289,8 +1326,12 @@ class DesktopCube {
         face.rotation_angle_y = angle;
         face.translation_z = -depthOffset;
 
-        // The wallpaper fades out while the cube is tilted, so you can see inside it.
-        face._background.opacity = Math.round(255 * (1.0 - Math.abs(pitch)));
+        // The wallpaper fades out while the cube is tilted, so you can see inside it. The
+        // desklets, desktop icons and panels are drawn flat on the wallpaper, so they fade
+        // with it rather than being left floating in front of nothing.
+        face._background.opacity = faceOpacity;
+        face._desktop.opacity = faceOpacity;
+        face._panels.opacity = faceOpacity;
 
         // Spread the windows between the face and `explode` pixels in front of it. The
         // topmost window ends up closest to the viewer.
@@ -2026,59 +2067,160 @@ class Skybox {
 }
 
 // --------------------------------------------------------- switching at the screen edges
-
-// While a window is dragged, pushing it against the left or right edge of the screen
-// switches to the neighboring workspace. Muffin moves the dragged window along by
-// itself when a workspace is activated during a move, so all we do is activate it.
 //
-// This is a port of the GNOME extension's edge switching, which uses GNOME's
-// PressureBarrier. Cinnamon has no such class, so the pressure logic is included here.
-// Unlike GNOME, we only create the barriers while a window is being dragged.
-const PRESSURE_TIMEOUT = 1000;
+// Pushing the pointer against an outer left/right screen edge rotates to the neighboring
+// workspace: while dragging a window (the window comes along, as before), or, if
+// enabled, with no window at all. A plain push can instead start free rotation, the
+// same mode as the cube-free-rotate hot corner action.
+//
+// Only "outer" edges count: the parts of a monitor's left/right side that have no other
+// monitor next to them. On an inner edge the pointer just crosses over, so there is
+// nothing to push against. Offset or mixed-height layouts leave outer pieces on inner
+// sides too (e.g. the lower part of a tall monitor next to a short one); those count.
+//
+// While the user pushes, the cube turns a little towards the target ("peek") in
+// proportion to the pressure. Reaching the threshold commits the rotation; easing off or
+// leaving the edge springs it back. The peek reuses DesktopCube's drag mode, so absorbing
+// the workspace switch and settling work exactly like a panel drag.
+//
+// Pressure is now a decaying sum instead of GNOME's one-second window, so it can drive
+// the peek smoothly. While pushing, the decay time constant is PRESSURE_TIMEOUT, which
+// gives about the same threshold feel as before for a steady push.
+
+const PRESSURE_TIMEOUT = 1000;  // ms, decay time constant while pushing
+const PUSH_IDLE = 150;          // ms without hits after which the push counts as over
+const RELEASE_TIME = 150;       // ms, decay time constant once the push is over
+const PEEK_TICK = 16;           // ms between peek updates
+const MAX_SINGLE_HIT = 15;      // px, one motion event counts at most this much
+const CORNER_MARGIN = 10;       // px kept free at monitor corners, for hot corners
+const PEEK_START = 0.4;         // fraction of the threshold before the cube starts to turn
+
+const MODIFIER_MASKS = {
+  none: 0,
+  ctrl: Clutter.ModifierType.CONTROL_MASK,
+  alt: Clutter.ModifierType.MOD1_MASK,
+  shift: Clutter.ModifierType.SHIFT_MASK,
+  // No Super: releasing it on its own opens the main menu.
+};
+const BUTTON_MASK = Clutter.ModifierType.BUTTON1_MASK | Clutter.ModifierType.BUTTON2_MASK |
+                    Clutter.ModifierType.BUTTON3_MASK;
+
+// The outer left/right edge pieces of the given monitors (Main.layoutManager.monitors).
+// direction is -1 for a left edge (previous workspace) and +1 for a right edge.
+function outerEdgeSegments(monitors) {
+  const subtract = (spans, a, b) => {
+    const out = [];
+    for (const [s, e] of spans) {
+      if (b <= s || a >= e) {
+        out.push([s, e]);
+        continue;
+      }
+      if (a > s) out.push([s, a]);
+      if (b < e) out.push([b, e]);
+    }
+    return out;
+  };
+
+  const segments = [];
+  monitors.forEach((m, index) => {
+    for (const left of [true, false]) {
+      // Same convention as the old barriers: x of the first column for a left edge,
+      // one past the last column for a right edge.
+      const x = left ? m.x : m.x + m.width;
+      let spans = [[m.y, m.y + m.height]];
+      for (const o of monitors) {
+        if (o !== m && (left ? o.x + o.width === x : o.x === x)) {
+          spans = subtract(spans, o.y, o.y + o.height);
+        }
+      }
+      for (let [y1, y2] of spans) {
+        // Keep the monitor's own corners free for hot corners.
+        if (y1 === m.y) y1 += CORNER_MARGIN;
+        if (y2 === m.y + m.height) y2 -= CORNER_MARGIN;
+        if (y2 > y1) {
+          segments.push({x, y1, y2, monitor: index, direction: left ? -1 : 1});
+        }
+      }
+    }
+  });
+  return segments;
+}
 
 class EdgeSwitch {
   constructor(cube) {
     this._cube = cube;
+    this._settings = cube._settings;
     this._barriers = [];
+    this._windowDrag = false;
+    this._peek = null;          // {direction, turn} while the cube is peeking
+    this._tickID = 0;
+    this._isTriggered = false;
+    this._reset();
+
     this._beginID = global.display.connect('grab-op-begin', (emitter, display, window, op) => {
-      if (op === Meta.GrabOp.MOVING && this._cube._settings.getValue('enable-edge-switch')) {
-        this._createBarriers();
+      if (op === Meta.GrabOp.MOVING) {
+        this._windowDrag = true;
+        this._update(false);
       }
     });
-    this._endID = global.display.connect('grab-op-end', () => this._destroyBarriers());
+    this._endID = global.display.connect('grab-op-end', () => {
+      // The window was dropped mid-peek: spring back.
+      if (this._windowDrag) {
+        this._cancel();
+      }
+      this._windowDrag = false;
+      this._update(false);
+    });
+    this._monitorsID = Main.layoutManager.connect('monitors-changed', () => this._update(true));
+    // Also call update(true) from the settings callbacks of enable-edge-switch and
+    // enable-edge-push.
+    this._update(false);
   }
 
   destroy() {
     global.display.disconnect(this._beginID);
     global.display.disconnect(this._endID);
+    Main.layoutManager.disconnect(this._monitorsID);
+    this._cancel();
     this._destroyBarriers();
   }
 
+  // Barriers exist all the time with edge push on, otherwise only during window drags.
+  // They sit where the pointer can't go anyway, so they don't change normal pointer use.
+  update(rebuild) {
+    this._update(rebuild);
+  }
+
+  _update(rebuild) {
+    const wanted = this._settings.getValue('enable-edge-push') ||
+      (this._windowDrag && this._settings.getValue('enable-edge-switch'));
+    if (!wanted) {
+      this._cancel();
+      this._destroyBarriers();
+    } else if (rebuild || this._barriers.length === 0) {
+      this._createBarriers();
+    }
+  }
+
   _createBarriers() {
+    this._cancel();
     this._destroyBarriers();
-    this._reset();
     this._isTriggered = false;
 
-    const width = global.screen_width;
-    const height = global.screen_height;
-    const make = (x, directions, direction) => {
-      const barrier = new Meta.Barrier({
-        display: global.display,
-        x1: x, y1: 1, x2: x, y2: height,
-        directions: directions,
-      });
-      barrier._direction = direction;
-      barrier._isHit = false;
-      barrier._hitID = barrier.connect('hit', (b, event) => this._onHit(b, event));
-      barrier._leftID = barrier.connect('left', (b) => this._onLeft(b));
-      return barrier;
-    };
-
     try {
-      this._barriers = [
-        make(0, Meta.BarrierDirection.POSITIVE_X, Meta.MotionDirection.LEFT),
-        make(width, Meta.BarrierDirection.NEGATIVE_X, Meta.MotionDirection.RIGHT),
-      ];
+      for (const segment of outerEdgeSegments(Main.layoutManager.monitors)) {
+        const barrier = new Meta.Barrier({
+          display: global.display,
+          x1: segment.x, y1: segment.y1, x2: segment.x, y2: segment.y2,
+          directions: segment.direction < 0 ? Meta.BarrierDirection.POSITIVE_X
+                                            : Meta.BarrierDirection.NEGATIVE_X,
+        });
+        barrier._segment = segment;
+        barrier._isHit = false;
+        barrier._hitID = barrier.connect('hit', (b, event) => this._onHit(b, event));
+        barrier._leftID = barrier.connect('left', (b) => this._onLeft(b));
+        this._barriers.push(barrier);
+      }
     } catch (e) {
       global.logError(`Desktop Cube Reloaded: could not create edge barriers: ${e}`);
       this._destroyBarriers();
@@ -2095,74 +2237,223 @@ class EdgeSwitch {
   }
 
   _reset() {
-    this._events = [];
     this._pressure = 0;
+    this._lastHit = 0;
+    this._lastDecay = this._now();
   }
 
-  // Same as GNOME's PressureBarrier: sum up how far the pointer tried to move into the
-  // barrier during the last second, and trigger once that exceeds the threshold.
+  _now() {
+    return GLib.get_monotonic_time() / 1000;
+  }
+
+  // A plain push (no window) set to start free rotation instead of switching.
+  _freeRotate() {
+    return !this._windowDrag &&
+      this._settings.getValue('edge-push-action') === 'free-rotate';
+  }
+
+  _threshold() {
+    return this._settings.getValue(this._windowDrag ? 'edge-switch-pressure'
+                                                    : 'edge-push-pressure');
+  }
+
+  // Whether a push on this barrier should do anything right now.
+  _allowed(barrier) {
+    const cube = this._cube;
+    // Don't take over a rotation that is already in progress (panel drag, hot corner,
+    // or a settle that hasn't activated its workspace yet). A plain switch animation is
+    // fine: beginDrag() picks the cube up where it is.
+    if (cube._anim && !this._peek && cube._anim.mode !== 'switch') {
+      return false;
+    }
+
+    if (this._windowDrag) {
+      return this._settings.getValue('enable-edge-switch');
+    }
+
+    if (!this._settings.getValue('enable-edge-push') || Main.modalCount) {
+      return false;
+    }
+    const [, , mods] = global.get_pointer();
+    // A held button means a text selection, a resize, a drag in some app...
+    if (mods & BUTTON_MASK) {
+      return false;
+    }
+    const need = MODIFIER_MASKS[this._settings.getValue('edge-push-modifier')] || 0;
+    if ((mods & need) !== need) {
+      return false;
+    }
+    // Games and videos. (Check that Muffin 6.0 has this; mutter of that age does.)
+    if (global.display.get_monitor_in_fullscreen(barrier._segment.monitor)) {
+      return false;
+    }
+    return true;
+  }
+
+  // false if there is no workspace in that direction (gap at the first/last one).
+  _targetIndex(direction) {
+    const manager = global.workspace_manager;
+    const n = manager.get_n_workspaces();
+    if (n < 2) {
+      return -1;
+    }
+    let index = manager.get_active_workspace_index() + direction;
+    if (index < 0 || index >= n) {
+      if (this._settings.getValue('last-first-gap')) {
+        return -1;
+      }
+      index = (index + n) % n;
+    }
+    return index;
+  }
+
+  _decay(now) {
+    const tau = now - this._lastHit > PUSH_IDLE ? RELEASE_TIME : PRESSURE_TIMEOUT;
+    this._pressure *= Math.exp(-(now - this._lastDecay) / tau);
+    this._lastDecay = now;
+  }
+
   _onHit(barrier, event) {
     barrier._isHit = true;
-
     // After triggering, wait until the pointer has left the edge before triggering again.
-    if (this._isTriggered) {
+    if (this._isTriggered || !this._allowed(barrier)) {
       return;
     }
+    const direction = barrier._segment.direction;
+    // Which way the peek turns the cube. Switching turns towards the next workspace, so
+    // the face slides away from the edge. Free rotation follows the hand (moving the
+    // mouse right slides the face right), so its peek slides the face into the edge;
+    // otherwise the cube would reverse the moment free rotation takes over.
+    const turn = this._freeRotate() ? -direction : direction;
+    // With the gap there may be no workspace that way. Free rotation can still start
+    // there; it just doesn't peek.
+    const canTurn = this._targetIndex(turn) >= 0;
+    if (!canTurn && !this._freeRotate()) {
+      return;
+    }
+    // A peek towards the other side (pointer jumped edges) starts over.
+    if (this._peek && this._peek.direction !== direction) {
+      this._cancel();
+    }
 
-    const threshold = this._cube._settings.getValue('edge-switch-pressure');
+    const threshold = this._threshold();
     const slide = Math.abs(event.dy);
-    let distance = Math.abs(event.dx);
+    const distance = Math.abs(event.dx);
+    const now = this._now();
+    this._decay(now);
 
     if (distance >= threshold) {
-      this._trigger(barrier);
-      return;
+      this._pressure = threshold;        // a hard flick commits at once, as before
+    } else if (slide > distance) {
+      return;                            // moving more along the edge than into it
+    } else {
+      this._pressure += Math.min(MAX_SINGLE_HIT, distance);
     }
-
-    // Ignore movements that run more along the edge than into it.
-    if (slide > distance) {
-      return;
-    }
-
-    this._events = this._events.filter(([time]) => event.time - time < PRESSURE_TIMEOUT);
-    this._pressure = this._events.reduce((sum, [, d]) => sum + d, 0);
-
-    distance = Math.min(15, distance);
-    this._events.push([event.time, distance]);
-    this._pressure += distance;
+    this._lastHit = now;
 
     if (this._pressure >= threshold) {
-      this._trigger(barrier);
+      this._commit(direction);
+      return;
     }
+
+    // Light pushes don't show the cube at all; it starts turning at PEEK_START.
+    if (!canTurn || this._settings.getValue('edge-peek') <= 0 ||
+        this._pressure < PEEK_START * threshold) {
+      return;
+    }
+    if (!this._peek) {
+      if (!this._cube.beginPeek()) {
+        return;
+      }
+      this._peek = {direction, turn};
+      this._tickID = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PEEK_TICK, () => this._tick());
+    }
+    this._showPeek();
+  }
+
+  // Keeps the peek following the pressure while no hit events arrive (the user holds
+  // still or eases off), and springs back once it has faded.
+  _tick() {
+    if (!this._peek) {
+      this._tickID = 0;
+      return GLib.SOURCE_REMOVE;
+    }
+    this._decay(this._now());
+    // Below PEEK_START the peek is back at zero, so springing back is seamless.
+    if (this._pressure < PEEK_START * this._threshold()) {
+      this._tickID = 0;     // _cancel() must not remove the source we're returning from
+      this._cancel();
+      return GLib.SOURCE_REMOVE;
+    }
+    this._showPeek();
+    return GLib.SOURCE_CONTINUE;
+  }
+
+  _showPeek() {
+    const amount = this._settings.getValue('edge-peek') / 100;    // fraction of a face
+    // PEEK_START..1 of the threshold maps to 0..1 of the peek.
+    const p = Math.max(0, Math.min(1,
+      (this._pressure / this._threshold() - PEEK_START) / (1 - PEEK_START)));
+    const eased = 1 - (1 - p) * (1 - p);                          // fast start, then slows
+    this._cube.updatePeek(this._peek.turn * amount * eased);
   }
 
   _onLeft(barrier) {
     barrier._isHit = false;
     if (this._barriers.every(b => !b._isHit)) {
-      this._reset();
+      this._cancel();
       this._isTriggered = false;
     }
   }
 
-  _trigger(barrier) {
+  _commit(direction) {
     this._isTriggered = true;
+    this._stopTick();
     this._reset();
 
-    const manager = global.workspace_manager;
-    const n = manager.get_n_workspaces();
-    const active = manager.get_active_workspace_index();
-    let index = active + (barrier._direction === Meta.MotionDirection.LEFT ? -1 : 1);
-
-    // A closed cube wraps around; with the gap we stop at the first/last workspace.
-    if (index < 0 || index >= n) {
-      if (this._cube._settings.getValue('last-first-gap')) {
-        return;
+    if (this._freeRotate()) {
+      // Hand the cube over to free rotation, starting from the peek angle (beginDrag
+      // picks up a cube that is already in drag mode where it is). Like the hot corner,
+      // the pointer stays at the screen center afterwards, away from the edge.
+      const peeking = !!this._peek;
+      this._peek = null;
+      const drag = this._cube._drag;
+      drag.startFromHotCorner(global.get_current_time());
+      if (drag._state !== DragState.ACTIVE && peeking) {
+        this._cube.cancelDrag();
       }
-      index = (index + n) % n;
+      return;
     }
 
-    const workspace = manager.get_workspace_by_index(index);
+    if (this._peek) {
+      this._peek = null;
+      // Continues from the peek angle; the workspace is activated when the cube
+      // arrives. Muffin moves a dragged window along at that point.
+      this._cube.commitPeek(direction);
+      return;
+    }
+
+    // No peek (setting is 0): switch right away, as the old code did.
+    const workspace = global.workspace_manager.get_workspace_by_index(
+      this._targetIndex(direction));
     if (workspace) {
       workspace.activate(global.get_current_time());
+    }
+  }
+
+  _cancel() {
+    this._stopTick();
+    this._reset();
+    if (this._peek) {
+      this._peek = null;
+      this._cube.cancelDrag();      // springs back to the workspace it started on
+    }
+  }
+
+  _stopTick() {
+    if (this._tickID) {
+      GLib.source_remove(this._tickID);
+      this._tickID = 0;
     }
   }
 }

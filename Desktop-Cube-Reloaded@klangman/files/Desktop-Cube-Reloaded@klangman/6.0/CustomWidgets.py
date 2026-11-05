@@ -10,7 +10,7 @@ import gettext
 import math
 
 from xapp.SettingsWidgets import SettingsWidget
-from gi.repository import Gio, Gtk, GdkPixbuf, GLib
+from gi.repository import Gio, Gtk, GdkPixbuf, GLib, Pango
 
 UUID = "Desktop-Cube-Reloaded@klangman"
 gettext.bindtextdomain(UUID, GLib.get_home_dir() + "/.local/share/locale")
@@ -206,3 +206,200 @@ class CompactScale(SettingsWidget):
             self.digits = digits
             self.content_widget.set_round_digits(digits)
             self.content_widget.set_digits(digits)
+
+
+# ---------------------------------------------------------------------------- hot corners
+#
+# Cinnamon keeps its hot corners in org.cinnamon "hotcorner-layout": four strings (top
+# left, top right, bottom left, bottom right) of the form "action:enabled:delay", where
+# action is expo, scale, desktop or a command (which may itself contain ':'). The cube
+# actions are commands the extension intercepts (see HOT_CORNER_ACTIONS in extension.js).
+#
+# Each corner gets a HotCornerChooser. Picking a cube action for a corner that Cinnamon
+# uses for something else first saves that corner's entry in the widget's own setting;
+# the first item of the dropdown then names the saved action and puts it back exactly
+# (action, on/off and delay). If the corner is changed in System Settings -> Hot Corners
+# to something that isn't a cube action, the saved entry is dropped.
+
+HOT_CORNER_SCHEMA = "org.cinnamon"
+HOT_CORNER_LAYOUT_KEY = "hotcorner-layout"
+CUBE_CORNER_ACTIONS = [
+   ("cube-free-rotate", _("Cube: rotate with the mouse")),
+   ("cube-rotate-left", _("Cube: rotate left")),
+   ("cube-rotate-right", _("Cube: rotate right")),
+]
+CUBE_CORNER_IDS = [action for action, label in CUBE_CORNER_ACTIONS]
+# Hover delay (ms) used when a corner without one gets a cube action. It helps against
+# triggering the cube by accident.
+DEFAULT_CUBE_CORNER_DELAY = 250
+
+
+def _parse_corner(entry):
+   parts = entry.rsplit(":", 2)   # the action (a command) may contain ':'
+   if len(parts) != 3:
+      return entry, False, 0
+   action, enabled, delay = parts
+   try:
+      delay = int(delay)
+   except ValueError:
+      delay = 0
+   return action, enabled == "true", delay
+
+
+def _is_cube_corner(entry):
+   action, enabled, delay = _parse_corner(entry)
+   return enabled and action in CUBE_CORNER_IDS
+
+
+def _describe_corner(entry):
+   action, enabled, delay = _parse_corner(entry)
+   if not enabled:
+      return _("Off")
+   names = {
+      "expo": _("Show all workspaces (Expo)"),
+      "scale": _("Show all windows (Scale)"),
+      "desktop": _("Show the desktop"),
+   }
+   return names.get(action, _("Run: %s") % action)
+
+
+class HotCornerChooser(SettingsWidget):
+   def __init__(self, info, key, settings):
+      SettingsWidget.__init__(self)
+      self.key = key
+      self.settings = settings
+      self.corner = info["corner"]
+      self.updating = False
+
+      self.cinnamon = Gio.Settings.new(HOT_CORNER_SCHEMA)
+
+      self.label = Gtk.Label.new(info["description"])
+      self.label.set_alignment(0.0, 0.5)
+      self.pack_start(self.label, True, True, 0)
+
+      self.model = Gtk.ListStore(str, str)   # cube action ('' = the other entry), label
+      self.combo = Gtk.ComboBox.new_with_model(self.model)
+      renderer = Gtk.CellRendererText()
+      renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+      renderer.set_property("max-width-chars", 32)
+      self.combo.pack_start(renderer, True)
+      self.combo.add_attribute(renderer, "text", 1)
+      self.pack_end(self.combo, False, False, 0)
+
+      if "tooltip" in info:
+         self.label.set_tooltip_markup(info["tooltip"])
+         self.combo.set_tooltip_markup(info["tooltip"])
+
+      self.combo.connect("changed", self.on_combo_changed)
+      self.layout_changed_id = self.cinnamon.connect("changed::" + HOT_CORNER_LAYOUT_KEY,
+                                                     self.on_layout_changed)
+      self.connect("destroy", self.on_destroy)
+      self.refresh()
+
+   def on_destroy(self, *args):
+      if self.layout_changed_id:
+         self.cinnamon.disconnect(self.layout_changed_id)
+         self.layout_changed_id = 0
+
+   def get_layout(self):
+      layout = list(self.cinnamon.get_strv(HOT_CORNER_LAYOUT_KEY))
+      return layout if len(layout) == 4 else None
+
+   def get_saved(self):
+      return self.settings.get_value(self.key) or ""
+
+   # The entry Cinnamon ships for this corner (always disabled).
+   def default_entry(self):
+      default = self.cinnamon.get_default_value(HOT_CORNER_LAYOUT_KEY)
+      entries = default.unpack() if default else []
+      return entries[self.corner] if len(entries) == 4 else "expo:false:0"
+
+   def on_layout_changed(self, *args):
+      self.refresh()
+
+   def refresh(self):
+      layout = self.get_layout()
+      if layout is None:
+         self.set_sensitive(False)
+         return
+      self.set_sensitive(True)
+      current = layout[self.corner]
+      saved = self.get_saved()
+
+      if _is_cube_corner(current):
+         action = _parse_corner(current)[0]
+         active = 1 + CUBE_CORNER_IDS.index(action)
+         other = _describe_corner(saved) if saved else _("Off")
+      else:
+         # Not a cube corner (any more): whatever Cinnamon has there is the "other" entry.
+         if saved:
+            self.settings.set_value(self.key, "")
+         active = 0
+         other = _describe_corner(current)
+
+      self.updating = True
+      self.model.clear()
+      self.model.append(["", other])
+      for action, label in CUBE_CORNER_ACTIONS:
+         self.model.append([action, label])
+      self.combo.set_active(active)
+      self.updating = False
+
+   def on_combo_changed(self, combo):
+      if self.updating:
+         return
+      it = combo.get_active_iter()
+      layout = self.get_layout()
+      if it is None or layout is None:
+         return
+      choice = self.model[it][0]
+      current = layout[self.corner]
+      is_cube = _is_cube_corner(current)
+
+      if choice:
+         if not is_cube:
+            # Remember what Cinnamon had here, so it can be put back.
+            self.settings.set_value(self.key, current)
+         delay = _parse_corner(current)[2]
+         if delay <= 0:
+            delay = DEFAULT_CUBE_CORNER_DELAY
+         layout[self.corner] = "%s:true:%d" % (choice, delay)
+      else:
+         if not is_cube:
+            return
+         saved = self.get_saved()
+         layout[self.corner] = saved if saved else self.default_entry()
+         self.settings.set_value(self.key, "")
+
+      self.cinnamon.set_strv(HOT_CORNER_LAYOUT_KEY, layout)
+
+
+# A row with a label and a button that opens a page of Cinnamon's System Settings. The
+# "module" key is the cinnamon-settings module name (e.g. "hotcorner" or "workspaces"),
+# "button" is the button's text. Runs cinnamon-settings directly, so it also works while
+# the extension is disabled.
+class SettingsLauncher(SettingsWidget):
+   def __init__(self, info, key, settings):
+      SettingsWidget.__init__(self)
+      self.module = info["module"]
+
+      self.label = Gtk.Label("", xalign=0.0)
+      self.label.set_markup(info["description"])
+      self.label.set_alignment(0.0, 0.5)
+      self.label.set_line_wrap(True)
+      self.pack_start(self.label, True, True, 0)
+
+      self.button = Gtk.Button.new_with_label(info.get("button", _("Open")))
+      self.button.set_valign(Gtk.Align.CENTER)
+      self.button.connect("clicked", self.on_clicked)
+      self.pack_end(self.button, False, False, 0)
+
+      if "tooltip" in info:
+         self.label.set_tooltip_markup(info["tooltip"])
+         self.button.set_tooltip_markup(info["tooltip"])
+
+   def on_clicked(self, *args):
+      try:
+         Gio.Subprocess.new(["cinnamon-settings", self.module], Gio.SubprocessFlags.NONE)
+      except GLib.Error as error:
+         print(f"{UUID}: could not open cinnamon-settings {self.module}: {error.message}")

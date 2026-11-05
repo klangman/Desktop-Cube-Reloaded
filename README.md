@@ -56,7 +56,10 @@ Known limitations and open items:
 - Hold `Super+Alt+Space` (or the shortcut set in the settings), keep `Super+Alt` held and move the mouse: sideways rotates the cube, up and down tilts it, the scroll wheel zooms.
   Release the keys (or left-click) to switch to the workspace facing you; right-click (or `Esc`) goes back.
 - Or press the left mouse button on an empty part of any panel and move the mouse, with the same controls; release the button to switch, or right-click (or `Esc`) to go back.
-- Hot corners: in *System Settings → Hot Corners*, set a corner to *Run a command* and enter one of:
+- Hot corners: on the *Hot Corners* tab of the extension's settings, pick a cube action for any corner.
+  If Cinnamon already uses that corner, its action stays the first item in the list, and picking it
+  again puts the corner back exactly as it was. Under the hood the corner is set to *Run a command*
+  with one of these names, which you can also enter by hand in *System Settings → Hot Corners*:
   - `cube-free-rotate`: rotate the cube with the mouse, no button or key held. Left-click (or `Enter`) switches to the workspace facing you; right-click (or `Esc`) goes back.
   - `cube-rotate-left` / `cube-rotate-right`: rotate to the workspace on the left / right, like `Ctrl+Alt+Left/Right`. Click the corner again to keep going.
 
