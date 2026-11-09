@@ -58,6 +58,7 @@ const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const Graphene = imports.gi.Graphene;
 const Meta = imports.gi.Meta;
+const PointerTracker = imports.misc.pointerTracker;
 const HotCorner = imports.ui.hotCorner;
 const Main = imports.ui.main;
 const Settings = imports.ui.settings;
@@ -1628,12 +1629,26 @@ function normalize([x, y, z]) {
   return [x / length, y / length, z / length];
 }
 
+// Calls obj.<name>_async(...args, callback) and returns a promise of obj.<name>_finish().
+function gioAsync(obj, name, ...args) {
+  return new Promise((resolve, reject) => {
+    obj[`${name}_async`](...args, (source, result) => {
+      try {
+        resolve(obj[`${name}_finish`](result));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
 class Skybox {
   constructor(file, uuid) {
     this._uuid = uuid;
     this.ready = false;
     this._destroyed = false;
     this._idleID = 0;
+    this._cancellable = new Gio.Cancellable();  // Stops file I/O on destroy.
     this._tiles = [];      // {actor, center, corners}: unit directions before rotation.
     this._faceActors = [];
     this._cosCone = 0;
@@ -1646,11 +1661,12 @@ class Skybox {
     this.actor.add_child(this._tilt);
     this._tilt.add_child(this._spin);
 
-    this._load(file);
+    this._load(file).catch(e => this._fail(e));
   }
 
   destroy() {
     this._destroyed = true;
+    this._cancellable.cancel();
     if (this._idleID) {
       GLib.source_remove(this._idleID);
       this._idleID = 0;
@@ -1691,17 +1707,18 @@ class Skybox {
     });
   }
 
-  _load(file) {
+  async _load(file) {
     // The settings widget may store a URI or a plain path.
     const gfile = file.startsWith('file://') ?
       Gio.File.new_for_uri(file) : Gio.File.new_for_path(file);
     this._name = gfile.get_basename() || file;
     this._file = file;
 
-    // Look for cached cube faces first.
+    // Cached cube faces are found by the panorama's location, date and size.
     try {
-      const info = gfile.query_info('time::modified,standard::size',
-                                    Gio.FileQueryInfoFlags.NONE, null);
+      const info = await gioAsync(gfile, 'query_info', 'time::modified,standard::size',
+                                  Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT,
+                                  this._cancellable);
       const key = GLib.compute_checksum_for_string(
         GLib.ChecksumType.SHA256,
         [SKY_CACHE_VERSION, gfile.get_uri(), info.get_attribute_uint64('time::modified'),
@@ -1713,11 +1730,28 @@ class Skybox {
       this._fail(e);
       return;
     }
+    if (this._destroyed) {
+      return;
+    }
 
-    if (GLib.file_test(this._cacheFile('complete'), GLib.FileTest.EXISTS)) {
-      this._loadCachedFace(0);
-    } else {
+    // The cache is used only if the "complete" marker shows that all faces were saved.
+    // Otherwise (usually because there is no marker yet) the panorama is converted.
+    try {
+      await gioAsync(Gio.File.new_for_path(this._cacheFile('complete')), 'query_info',
+                     'standard::type', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT,
+                     this._cancellable);
+    } catch (e) {
+      if (this._destroyed) {
+        return;
+      }
+      if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+        global.log(`${this._uuid}: ignoring the panorama cache: ${e}`);
+      }
       this._loadPanorama(gfile);
+      return;
+    }
+    if (!this._destroyed) {
+      this._loadCachedFace(0);
     }
   }
 
@@ -1726,6 +1760,9 @@ class Skybox {
   }
 
   _fail(error) {
+    if (this._destroyed) {
+      return;  // Cancelled by destroy().
+    }
     global.logError(`${this._uuid}: could not load panorama ${this._file}: ${error}`);
     Main.warningNotify(
       'Desktop Cube Reloaded: the panorama could not be loaded',
@@ -1745,6 +1782,9 @@ class Skybox {
     }
 
     const fallback = (error) => {
+      if (this._destroyed) {
+        return;
+      }
       global.log(`${this._uuid}: ignoring the panorama cache: ${error}`);
       this._clearFaces();
       const file = this._file;
@@ -1753,10 +1793,10 @@ class Skybox {
     };
 
     const gfile = Gio.File.new_for_path(this._cacheFile(`face-${index}.png`));
-    gfile.read_async(GLib.PRIORITY_DEFAULT, null, (obj, readResult) => {
+    gfile.read_async(GLib.PRIORITY_DEFAULT, this._cancellable, (obj, readResult) => {
       try {
         const stream = gfile.read_finish(readResult);
-        GdkPixbuf.Pixbuf.new_from_stream_async(stream, null, (obj2, result) => {
+        GdkPixbuf.Pixbuf.new_from_stream_async(stream, this._cancellable, (obj2, result) => {
           try {
             const pixbuf = GdkPixbuf.Pixbuf.new_from_stream_finish(result);
             if (this._destroyed) {
@@ -1786,7 +1826,7 @@ class Skybox {
 
   // Decodes the panorama and starts converting it into cube faces.
   _loadPanorama(gfile) {
-    gfile.read_async(GLib.PRIORITY_DEFAULT, null, (obj, readResult) => {
+    gfile.read_async(GLib.PRIORITY_DEFAULT, this._cancellable, (obj, readResult) => {
       let stream;
       try {
         stream = gfile.read_finish(readResult);
@@ -1795,7 +1835,7 @@ class Skybox {
         return;
       }
 
-      GdkPixbuf.Pixbuf.new_from_stream_async(stream, null, (obj2, result) => {
+      GdkPixbuf.Pixbuf.new_from_stream_async(stream, this._cancellable, (obj2, result) => {
         let pixbuf;
         try {
           pixbuf = GdkPixbuf.Pixbuf.new_from_stream_finish(result);
@@ -1839,20 +1879,27 @@ class Skybox {
         this._row = 0;
         this._facePixels = new Uint8Array(this._faceSize * this._faceSize * 3);
         this._savedFaces = 0;
-        this._prepareCacheDir();
-
-        this._idleID = GLib.idle_add(GLib.PRIORITY_LOW, () => {
-          try {
-            return this._convertSome();
-          } catch (e) {
-            this._idleID = 0;
-            this._source = null;
-            this._facePixels = null;
-            this._fail(e);
-            return GLib.SOURCE_REMOVE;
-          }
-        });
+        // The old "complete" marker must be gone before any new face is saved.
+        this._prepareCacheDir().then(() => this._startConversion());
       });
+    });
+  }
+
+  // Computes the faces in idle time, a slice at a time, so the desktop stays responsive.
+  _startConversion() {
+    if (this._destroyed) {
+      return;
+    }
+    this._idleID = GLib.idle_add(GLib.PRIORITY_LOW, () => {
+      try {
+        return this._convertSome();
+      } catch (e) {
+        this._idleID = 0;
+        this._source = null;
+        this._facePixels = null;
+        this._fail(e);
+        return GLib.SOURCE_REMOVE;
+      }
     });
   }
 
@@ -1976,42 +2023,62 @@ class Skybox {
     }
   }
 
-  // Creates this panorama's cache directory and removes the caches of other panoramas.
-  // The cache is only an optimization, so errors are logged and otherwise ignored.
-  _prepareCacheDir() {
+  // Creates this panorama's cache directory and deletes its "complete" marker, since the
+  // faces are about to be rewritten. Then removes other panoramas' caches in the
+  // background. The cache is only an optimization, so errors are logged and ignored.
+  async _prepareCacheDir() {
+    GLib.mkdir_with_parents(this._cacheDir, 0o755);
     try {
-      GLib.mkdir_with_parents(this._cacheDir, 0o755);
-
-      // If faces are being rewritten (the old ones were broken), the cache is not
-      // complete until they are all saved again.
-      const marker = Gio.File.new_for_path(this._cacheFile('complete'));
-      if (GLib.file_test(marker.get_path(), GLib.FileTest.EXISTS)) {
-        marker.delete(null);
+      await gioAsync(Gio.File.new_for_path(this._cacheFile('complete')), 'delete',
+                     GLib.PRIORITY_DEFAULT, this._cancellable);
+    } catch (e) {
+      if (!this._destroyed && !e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+        global.logError(`${this._uuid}: could not prepare the panorama cache: ${e}`);
       }
+    }
+    if (!this._destroyed) {
+      this._removeOldCaches();
+    }
+  }
 
+  async _removeOldCaches() {
+    try {
       const root = Gio.File.new_for_path(this._cacheRoot);
-      const entries = root.enumerate_children('standard::name,standard::type',
-                                              Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
-      let info;
-      while ((info = entries.next_file(null)) !== null) {
+      for (const info of await this._listDir(root, 'standard::name,standard::type')) {
         const dir = root.get_child(info.get_name());
         if (dir.get_path() === this._cacheDir ||
             info.get_file_type() !== Gio.FileType.DIRECTORY) {
           continue;
         }
-        const files = dir.enumerate_children('standard::name',
-                                             Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
-        let child;
-        while ((child = files.next_file(null)) !== null) {
-          dir.get_child(child.get_name()).delete(null);
+        for (const child of await this._listDir(dir, 'standard::name')) {
+          await gioAsync(dir.get_child(child.get_name()), 'delete', GLib.PRIORITY_LOW,
+                         this._cancellable);
         }
-        files.close(null);
-        dir.delete(null);
+        await gioAsync(dir, 'delete', GLib.PRIORITY_LOW, this._cancellable);
       }
-      entries.close(null);
     } catch (e) {
-      global.logError(`${this._uuid}: could not prepare the panorama cache: ${e}`);
+      if (!this._destroyed) {
+        global.logError(`${this._uuid}: could not remove old panorama caches: ${e}`);
+      }
     }
+  }
+
+  // Returns the FileInfos of a directory's children.
+  async _listDir(dir, attributes) {
+    const enumerator = await gioAsync(dir, 'enumerate_children', attributes,
+                                      Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                                      GLib.PRIORITY_LOW, this._cancellable);
+    const infos = [];
+    try {
+      let batch;
+      while ((batch = await gioAsync(enumerator, 'next_files', 100, GLib.PRIORITY_LOW,
+                                     this._cancellable)).length > 0) {
+        infos.push(...batch);
+      }
+    } finally {
+      enumerator.close_async(GLib.PRIORITY_LOW, null, () => {});
+    }
+    return infos;
   }
 
   // Saves a face as PNG on a worker thread. Once all six are written, the "complete"
@@ -2020,7 +2087,7 @@ class Skybox {
     try {
       const gfile = Gio.File.new_for_path(this._cacheFile(`face-${index}.png`));
       const stream = gfile.replace(null, false, Gio.FileCreateFlags.NONE, null);
-      pixbuf.save_to_streamv_async(stream, 'png', ['compression'], ['3'], null,
+      pixbuf.save_to_streamv_async(stream, 'png', ['compression'], ['3'], this._cancellable,
                                    (obj, result) => {
         try {
           GdkPixbuf.Pixbuf.save_to_stream_finish(result);
@@ -2030,7 +2097,9 @@ class Skybox {
             GLib.file_set_contents(this._cacheFile('complete'), '');
           }
         } catch (e) {
-          global.logError(`${this._uuid}: could not save the panorama cache: ${e}`);
+          if (!this._destroyed) {
+            global.logError(`${this._uuid}: could not save the panorama cache: ${e}`);
+          }
         }
       });
     } catch (e) {
@@ -2079,8 +2148,9 @@ class Skybox {
 // sides too (e.g. the lower part of a tall monitor next to a short one); those count.
 //
 // While the user pushes, the cube turns a little towards the target ("peek") in
-// proportion to the pressure. Reaching the threshold commits the rotation; easing off or
-// leaving the edge springs it back. The peek reuses DesktopCube's drag mode, so absorbing
+// proportion to the pressure. Reaching the threshold commits the rotation. Resting at the
+// edge holds the peek; moving the pointer a little away from the edge springs it back.
+// The peek reuses DesktopCube's drag mode, so absorbing
 // the workspace switch and settling work exactly like a panel drag.
 //
 // Pressure is now a decaying sum instead of GNOME's one-second window, so it can drive
@@ -2093,6 +2163,7 @@ const RELEASE_TIME = 150;       // ms, decay time constant once the push is over
 const PEEK_TICK = 16;           // ms between peek updates
 const MAX_SINGLE_HIT = 15;      // px, one motion event counts at most this much
 const CORNER_MARGIN = 10;       // px kept free at monitor corners, for hot corners
+const LEAVE_DISTANCE = 10;      // px the pointer must move away from the edge to end a peek
 const PEEK_START = 0.4;         // fraction of the threshold before the cube starts to turn
 
 const MODIFIER_MASKS = {
@@ -2153,6 +2224,7 @@ class EdgeSwitch {
     this._barriers = [];
     this._windowDrag = false;
     this._peek = null;          // {direction, turn} while the cube is peeking
+    this._leaving = null;       // the barrier the pointer just moved off, during a peek
     this._tickID = 0;
     this._isTriggered = false;
     this._reset();
@@ -2307,7 +2379,15 @@ class EdgeSwitch {
     return index;
   }
 
+  // Before the peek shows, pressure fades, so stray bumps against the edge never add up
+  // to anything. Once the peek is showing, the user can see where they are, so it holds
+  // for as long as the pointer stays at the edge, however the mouse wobbles; it only
+  // goes away when the pointer moves off the edge (see _onLeft and _tick).
   _decay(now) {
+    if (this._peek && (this._leaving || this._barriers.some(b => b._isHit))) {
+      this._lastDecay = now;
+      return;
+    }
     const tau = now - this._lastHit > PUSH_IDLE ? RELEASE_TIME : PRESSURE_TIMEOUT;
     this._pressure *= Math.exp(-(now - this._lastDecay) / tau);
     this._lastDecay = now;
@@ -2315,6 +2395,7 @@ class EdgeSwitch {
 
   _onHit(barrier, event) {
     barrier._isHit = true;
+    this._leaving = null;               // back at the edge
     // After triggering, wait until the pointer has left the edge before triggering again.
     if (this._isTriggered || !this._allowed(barrier)) {
       return;
@@ -2344,8 +2425,8 @@ class EdgeSwitch {
 
     if (distance >= threshold) {
       this._pressure = threshold;        // a hard flick commits at once, as before
-    } else if (slide > distance) {
-      return;                            // moving more along the edge than into it
+    } else if (slide * 2 > distance) {
+      return;                            // not clearly into the edge (e.g. moving along it)
     } else {
       this._pressure += Math.min(MAX_SINGLE_HIT, distance);
     }
@@ -2378,6 +2459,14 @@ class EdgeSwitch {
       this._tickID = 0;
       return GLib.SOURCE_REMOVE;
     }
+    // The pointer moved off the edge during a peek: end it once it is clearly away,
+    // so a small wobble doesn't drop the peek.
+    if (this._leaving && this._isAwayFrom(this._leaving)) {
+      this._tickID = 0;     // _cancel() must not remove the source we're returning from
+      this._cancel();
+      this._isTriggered = false;
+      return GLib.SOURCE_REMOVE;
+    }
     this._decay(this._now());
     // Below PEEK_START the peek is back at zero, so springing back is seamless.
     if (this._pressure < PEEK_START * this._threshold()) {
@@ -2400,16 +2489,36 @@ class EdgeSwitch {
 
   _onLeft(barrier) {
     barrier._isHit = false;
-    if (this._barriers.every(b => !b._isHit)) {
-      this._cancel();
-      this._isTriggered = false;
+    if (this._barriers.some(b => b._isHit)) {
+      return;
     }
+    // During a peek, _tick ends it once the pointer is LEAVE_DISTANCE away.
+    if (this._peek) {
+      this._leaving = barrier;
+      return;
+    }
+    this._cancel();
+    this._isTriggered = false;
+  }
+
+  // Whether the pointer is at least LEAVE_DISTANCE away from the barrier's edge, or has
+  // slid past the end of its segment.
+  _isAwayFrom(barrier) {
+    const [x, y] = global.get_pointer();
+    const seg = barrier._segment;
+    if (y < seg.y1 || y >= seg.y2) {
+      return true;
+    }
+    // A left edge's barrier is at its first column, a right edge's one past its last.
+    const distance = seg.direction < 0 ? x - seg.x : seg.x - 1 - x;
+    return distance >= LEAVE_DISTANCE;
   }
 
   _commit(direction) {
     this._isTriggered = true;
     this._stopTick();
     this._reset();
+    this._leaving = null;
 
     if (this._freeRotate()) {
       // Hand the cube over to free rotation, starting from the peek angle (beginDrag
@@ -2444,6 +2553,7 @@ class EdgeSwitch {
   _cancel() {
     this._stopTick();
     this._reset();
+    this._leaving = null;
     if (this._peek) {
       this._peek = null;
       this._cube.cancelDrag();      // springs back to the workspace it started on
@@ -2851,8 +2961,7 @@ class DragController {
 
   _warp(x, y) {
     try {
-      Clutter.get_default_backend().get_default_seat().warp_pointer(Math.round(x),
-                                                                    Math.round(y));
+      new PointerTracker.PointerTracker().setPosition(x, y);
     } catch (e) {
       global.logError(`Desktop Cube Reloaded: could not move the pointer: ${e}`);
     }
