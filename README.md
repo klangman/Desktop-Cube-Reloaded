@@ -27,20 +27,26 @@ Supports Cinnamon 6.0 and newer.
 
 Additions that are not in the GNOME extension:
 
-| Feature                                                                                               | Status |
-| ----------------------------------------------------------------------------------------------------- | ------ |
-| Hold a shortcut (default `Super+Alt+Space`) to rotate the cube with the mouse, anywhere on the screen | Done   |
-| Zooming with the scroll wheel while rotating with the mouse                                           | Done   |
-| Esc while rotating with the mouse goes back to the starting workspace                                 | Done   |
-| Panels drawn on the cube faces (default), above the cube, or hidden while the cube is shown          | Done   |
-| Desklets are shown on the cube faces                                                                  | Done   |
-| Hot corner actions: free rotation with the mouse, rotate left, rotate right                           | Done   |
-| Zooming out automatically while the cube moves (0–30 %, default 10 %)                                 | Done   |
+| Feature                                                                                                                               | Status |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| Hold a shortcut (default `Super+Alt+Space`) to rotate the cube with the mouse, anywhere on the screen                                 | Done   |
+| Zooming with the scroll wheel while rotating with the mouse                                                                           | Done   |
+| Esc while rotating with the mouse goes back to the starting workspace                                                                 | Done   |
+| Panels drawn on the cube faces (default), above the cube, or hidden while the cube is shown                                           | Done   |
+| Desklets are shown on the cube faces                                                                                                  | Done   |
+| With Blur Cinnamon, blurred desklet and panel backgrounds are drawn on the cube faces                                                 | Done   |
+| Hot corner actions: free rotation with the mouse, rotate left, rotate right, set from the extension's settings                        | Done   |
+| Zooming out automatically while the cube moves (0–30 %, default 10 %)                                                                 | Done   |
+| Switching workspaces by pushing the mouse against the screen edge, no window needed, optionally only while holding Ctrl, Alt or Shift | Done   |
+| Pushing the mouse against the screen edge can start free rotation instead of switching                                                | Done   |
+| The cube turns towards the next workspace while you push against an edge, as a preview before it switches                             | Done   |
+| Edge switching uses only the outer screen edges on multi-monitor setups and keeps the corners free for hot corners                    | Done   |
+| The gap option follows Cinnamon's *Allow cycling through workspaces* setting                                                          | Done   |
 
 Known limitations and open items:
 
 - Cinnamon 6.0 support is based on reading the 6.0 source; it has only been tested on newer versions so far.
-- With Blur Cinnamon, desklets are shown without their blurred background while the cube rotates, and the workspace OSD isn't integrated with Blur Cinnamon yet.
+- With Blur Cinnamon, the workspace OSD isn't integrated with Blur Cinnamon yet.
 - Panels on the cube faces are live copies of the real panels, so every face shows the same panel: a window list that only shows the current workspace, or the workspace switcher, shows the current workspace's state on every face. With Blur Cinnamon, a panel's blur is missing on the other faces while a fullscreen window hides that panel on the current one.
 - Tilting the cube shows the back sides of the other faces; that is expected.
 - The cube in Expo is not planned for now. Expo is the same in Cinnamon 6.0 to 6.4 and
@@ -53,21 +59,32 @@ Known limitations and open items:
 ## Usage
 
 - Switch workspaces as usual (e.g. `Ctrl+Alt+Left/Right`) and the cube rotates.
+
 - Hold `Super+Alt+Space` (or the shortcut set in the settings), keep `Super+Alt` held and move the mouse: sideways rotates the cube, up and down tilts it, the scroll wheel zooms.
   Release the keys (or left-click) to switch to the workspace facing you; right-click (or `Esc`) goes back.
+
 - Or press the left mouse button on an empty part of any panel and move the mouse, with the same controls; release the button to switch, or right-click (or `Esc`) to go back.
+
 - Hot corners: on the *Hot Corners* tab of the extension's settings, pick a cube action for any corner.
   If Cinnamon already uses that corner, its action stays the first item in the list, and picking it
   again puts the corner back exactly as it was. Under the hood the corner is set to *Run a command*
   with one of these names, which you can also enter by hand in *System Settings → Hot Corners*:
+
   - `cube-free-rotate`: rotate the cube with the mouse, no button or key held. Left-click (or `Enter`) switches to the workspace facing you; right-click (or `Esc`) goes back.
   - `cube-rotate-left` / `cube-rotate-right`: rotate to the workspace on the left / right, like `Ctrl+Alt+Left/Right`. Click the corner again to keep going.
 
   A short hover delay (200–300 ms) on the corner helps against triggering it by accident. If the extension is disabled, Cinnamon tries to run these names as commands, which only logs an error.
+
 - While dragging a window, push it against the left or right screen edge to rotate to the next workspace, taking the window along.
+
+- Optionally (*Screen Edges* tab), push the mouse itself against the left or right screen edge to rotate to the next workspace, or to start free rotation. It can be limited to pushes made while holding `Ctrl`, `Alt` or `Shift`.
+  While you push, the cube already turns a little towards the next workspace; move away from the edge to cancel. Only outer screen edges count (not the ones between two monitors), and the corners are left free for hot corners.
+
 - The pointer is hidden while rotating with the mouse, so screen edges don't get in the way.
+
 - Turn off *Leave a gap between the last and first workspace* in the settings for a
-  closed cube.
+  closed cube. The option is kept in step with Cinnamon's *Allow cycling through workspaces*.
+
 - Pick a 360° panorama (equirectangular, 2:1) on the *Background* tab to show it around the cube.
 
 ## How it works
@@ -118,7 +135,7 @@ the extension's reload button in Looking Glass (`Alt+F2`, `lg`, *Extensions* tab
 
 ## Credit
 
-So far every single line of code is a copy from Simon Schneegans' [Desktop Cube](https://github.com/Schneegans/Desktop-Cube)  (the Gnome version) or my [Blur Cinnamon](https://github.com/klangman/BlurCinnamon) or written by Claude AI based on my prompting with very limited code review. Before I offer this up to Cinnamon Spices I will do a more detailed code review.
+So far every single line of code is a copy from Simon Schneegans' [Desktop Cube](https://github.com/Schneegans/Desktop-Cube)  (the Gnome version), my [Blur Cinnamon](https://github.com/klangman/BlurCinnamon) or written by Claude AI based on my prompting. I have done a code review of the AI generated code and found no changes were required.
 
 The extension icon is Simon Schneegans' Desktop Cube icon, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 

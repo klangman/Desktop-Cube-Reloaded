@@ -24,6 +24,7 @@
                 "last-first-gap",
                 "window-parallax",
                 "auto-zoom-out",
+                "moving-window-transparency",
                 "panel-mode",
                 "per-monitor-perspective",
                 "open-workspace-settings"
@@ -183,6 +184,18 @@
         "step": 1,
         "default": 10,
         "tooltip": "While the cube rotates, it moves back until it looks this much smaller than the screen, then comes forward again as it stops. When you rotate the cube with the mouse, it zooms out as you start moving the mouse. 0 turns it off.",
+        "digits": 0
+    },
+    "moving-window-transparency": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "CompactScale",
+        "description": "See-through moved window (%)",
+        "min": 0,
+        "max": 80,
+        "step": 5,
+        "default": 30,
+        "tooltip": "A window you move to the next workspace (with the keyboard, or by dragging it against the screen edge) stays in front while the cube turns behind it. It becomes this much see-through while the cube moves, so you can see the cube behind it, and is solid again when the cube stops. 0 turns it off.",
         "digits": 0
     },
     "panel-mode": {

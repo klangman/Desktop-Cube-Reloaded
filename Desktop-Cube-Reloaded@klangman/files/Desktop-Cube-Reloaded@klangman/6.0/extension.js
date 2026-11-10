@@ -101,6 +101,8 @@ const MAX_ZOOM_OUT = 3.0;
 // the same at the end for zooming back in), and how many pixels the mouse has to
 // travel during a mouse rotation for the full zoom-out.
 const AUTO_ZOOM_EDGE = 0.3;
+// How far (in workspaces) the edge peek turns before a dragged window is fully faded.
+const PEEK_FADE = 0.02;
 const AUTO_ZOOM_DRAG_DISTANCE = 150;
 
 let desktopCube = null;
@@ -194,6 +196,51 @@ function createFaceClone(source, x, y) {
     clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
   }
   return clone;
+}
+
+// The rect a window actor paints into, in stage coordinates: its buffer plus its shadow.
+function getPaintRect(actor) {
+  try {
+    const [ok, box] = actor.get_paint_box();
+    if (ok) {
+      return {x1: box.x1, y1: box.y1, x2: box.x2, y2: box.y2};
+    }
+  } catch (e) {
+    // Fall back to the allocation below.
+  }
+  return {x1: actor.x, y1: actor.y, x2: actor.x + actor.width, y2: actor.y + actor.height};
+}
+
+// True if the two rects (Meta.Rectangle or monitor-style {x, y, width, height}) overlap.
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.width && b.x < a.x + a.width &&
+         a.y < b.y + b.height && b.y < a.y + a.height;
+}
+
+// True if `rect` lies entirely inside `monitor`.
+function rectInside(rect, monitor) {
+  return rect.x >= monitor.x && rect.y >= monitor.y &&
+         rect.x + rect.width <= monitor.x + monitor.width &&
+         rect.y + rect.height <= monitor.y + monitor.height;
+}
+
+// Returns a clone of a window actor for a face of `monitor`, showing only the part of the
+// window that is on that monitor, the way the real screen shows it. Used for windows that
+// straddle two monitors (each monitor's cube gets its own part) or hang off the screen.
+// The clip is done flat (see createFlatClip()), never under the cube's 3D transform. The
+// clip rect starts from the paint box rather than the frame so the shadow is kept on the
+// sides away from the monitor edge. Returns null if nothing of the window is on `monitor`.
+function createMonitorClippedClone(actor, monitor) {
+  const paint = getPaintRect(actor);
+  const x1 = Math.floor(Math.max(paint.x1, monitor.x));
+  const y1 = Math.floor(Math.max(paint.y1, monitor.y));
+  const x2 = Math.ceil(Math.min(paint.x2, monitor.x + monitor.width));
+  const y2 = Math.ceil(Math.min(paint.y2, monitor.y + monitor.height));
+  if (x2 <= x1 || y2 <= y1) {
+    return null;
+  }
+  const clone = new Clutter.Clone({source: actor, x: actor.x - x1, y: actor.y - y1});
+  return createFlatClip(clone, x1 - monitor.x, y1 - monitor.y, x2 - x1, y2 - y1);
 }
 
 class DesktopCube {
@@ -512,6 +559,12 @@ class DesktopCube {
 
     this._playSwitchFeedback();
 
+    // Cinnamon sets _movingWindow when a window is moved to the next workspace with the
+    // keyboard; that window stays in place while the cube turns. Like Cinnamon's own
+    // animation, each switch takes it over, so a later plain switch doesn't keep it.
+    const movingWindow = Main.wm._movingWindow || null;
+    Main.wm._movingWindow = undefined;
+
     // A workspace was added or removed while the cube was shown; it is outdated.
     if (this._anim && this._anim.nWorkspaces !== nWorkspaces) {
       this._finish();
@@ -521,7 +574,13 @@ class DesktopCube {
     const base = this._anim ? this._nearestEquivalent(from, this._anim.progress) : from;
     const target = base + this._getSteps(from, to, nWorkspaces);
 
-    this._ensureScene(from);
+    // The window that stays in place changed (another window was moved, or this is a
+    // plain switch right after moving one): rebuild the scene around the current pose.
+    if (this._anim && this._anim.movingWindow !== movingWindow) {
+      this._rebuildScene(movingWindow);
+    }
+
+    this._ensureScene(from, movingWindow);
     this._anim.mode = 'switch';
     this._anim.pending++;   // Muffin counts switches; each needs a completion call.
     this._switchCounted = true;
@@ -620,6 +679,7 @@ class DesktopCube {
     const start = anim.dragAutoZoomStart;
     anim.autoZoom = start + (1 - start) *
       Math.min(1, anim.dragDistance / AUTO_ZOOM_DRAG_DISTANCE);
+    anim.fade = Math.max(anim.fade, Math.min(1, anim.dragDistance / AUTO_ZOOM_DRAG_DISTANCE));
     this._updateCubes();
   }
 
@@ -668,6 +728,9 @@ class DesktopCube {
     // A light zoom-out that grows with the peek, like the one during a mouse rotation.
     const start = anim.dragAutoZoomStart;
     anim.autoZoom = start + (1 - start) * Math.min(1, Math.abs(offset) / 0.25);
+    // The peek turns the cube only a little, so a dragged window is fully see-through
+    // early on; it gets solid again as the cube settles.
+    anim.fade = Math.min(1, Math.abs(offset) / PEEK_FADE);
     this._updateCubes();
   }
 
@@ -692,26 +755,28 @@ class DesktopCube {
 
   // ---------------------------------------------------------------------- animation
 
-  // Shows the cube, facing workspace `index`, unless it is already shown.
-  _ensureScene(index) {
+  // Shows the cube, facing workspace `index`, unless it is already shown. movingWindow
+  // is a window being moved to the new workspace with the keyboard; it doesn't rotate.
+  _ensureScene(index, movingWindow = null) {
     if (this._anim) {
       return;
     }
 
     const timeline = this._createTimeline();
     timeline.set_progress_mode(Clutter.AnimationMode.EASE_OUT_CUBIC);
-    const cinnamonwm = global.window_manager;
 
     this._anim = {
       mode: 'switch',
       nWorkspaces: global.workspace_manager.get_n_workspaces(),
       pending: 0,
       absorbSwitch: false,
+      movingWindow: movingWindow,
       progress: index,
       pitch: 0,
       zoom: 0,
       autoZoom: 0,
-      start: {progress: index, pitch: 0, zoom: 0, autoZoom: 0},
+      fade: 0,      // how see-through a carried window is, 0..1 (scaled by the setting)
+      start: {progress: index, pitch: 0, zoom: 0, autoZoom: 0, fade: 0},
       target: {progress: index, pitch: 0, zoom: 0},
       timeline: timeline,
       cubes: [],
@@ -746,22 +811,53 @@ class DesktopCube {
         // After a mouse rotation: zoom back in together with the rotation and tilt
         // (same eased progress), so the cube squares up and comes forward in one motion.
         anim.autoZoom = anim.start.autoZoom * (1 - t);
+        anim.fade = anim.start.fade * (1 - t);
       } else {
-        anim.autoZoom = this._autoZoomEnvelope(timeline.get_elapsed_time() /
-                                               timeline.get_duration(), anim.start.autoZoom);
+        const elapsed = timeline.get_elapsed_time() / timeline.get_duration();
+        anim.autoZoom = this._autoZoomEnvelope(elapsed, anim.start.autoZoom);
+        anim.fade = this._autoZoomEnvelope(elapsed, anim.start.fade);
       }
       this._updateCubes();
     }));
     anim.completedID = timeline.connect('completed',
                                         guard('animation end', () => this._onAnimationDone()));
 
-    // Muffin can ask us to abort, e.g. when a window is mapped during the switch.
-    anim.killID = cinnamonwm.connect('kill-switch-workspace', () => {
-      if (anim.mode === 'switch') {
-        this._finish();
-      }
-    });
+    // No 'kill-switch-workspace' handler: Muffin emits it only right before it calls
+    // _switchWorkspace again, and that continues the rotation from where it is. Ending
+    // the animation there would make every quick second switch start over.
 
+    this._updateCubes();
+  }
+
+  // Replaces the cube's contents with a fresh scene, keeping the rotation, the zoom and
+  // the running animation. Used when the windows that stay in place change mid-turn.
+  _rebuildScene(movingWindow) {
+    const anim = this._anim;
+    this._detachSkybox(anim);
+    if (anim.root) {
+      anim.root.destroy();
+    }
+    anim.root = null;
+    anim.skyLayer = null;
+    anim.cubes = [];
+    anim.followers = [];
+    if (anim.cubeNotified) {
+      const notifier = getCubeNotifier();
+      notifier.active = false;
+      notifier.emit('cube-finished');
+      anim.cubeNotified = false;
+    }
+    // _buildScene clones the desklets inside the window group while it is visible and
+    // hides it again; nothing is painted in between.
+    global.window_group.show();
+
+    anim.movingWindow = movingWindow;
+    try {
+      this._buildScene();
+    } catch (e) {
+      this._finish();
+      throw e;
+    }
     this._updateCubes();
   }
 
@@ -793,7 +889,7 @@ class DesktopCube {
   _animateTo(progress, duration) {
     const anim = this._anim;
     anim.start = {progress: anim.progress, pitch: anim.pitch, zoom: anim.zoom,
-                  autoZoom: anim.autoZoom};
+                  autoZoom: anim.autoZoom, fade: anim.fade};
     anim.target = {progress: progress, pitch: 0, zoom: 0};
 
     const timeline = anim.timeline;
@@ -851,11 +947,6 @@ class DesktopCube {
         anim.timeline.disconnect(anim.completedID);
       }
       anim.timeline.stop();
-    });
-    step(() => {
-      if (anim.killID) {
-        global.window_manager.disconnect(anim.killID);
-      }
     });
 
     // The skybox is kept between rotations, so take it out before destroying the scene.
@@ -993,30 +1084,43 @@ class DesktopCube {
         return;
       }
 
-      const monitorIndex = Math.max(0, window.get_monitor());
-      const monitor = monitors[monitorIndex] || monitors[primary];
-      const layer = layers[monitorIndex] || layers[primary];
+      // A window is drawn on every monitor it overlaps, not only on the one Cinnamon
+      // assigns it to (the one holding most of it). A window straddling two monitors then
+      // shows its left part on one cube and its right part on the other, each clipped to
+      // its face, instead of hanging off the side of one cube.
+      const ownIndex = monitors[window.get_monitor()] ? window.get_monitor() : primary;
+      const frame = window.get_frame_rect();
+      const targets = [];
+      monitors.forEach((monitor, index) => {
+        if (index === ownIndex || rectsOverlap(frame, monitor)) {
+          targets.push(index);
+        }
+      });
 
       // Desktop icons go on the face's flat desktop layer, everything else floats.
       const isDesktop = type === Meta.WindowType.DESKTOP;
-      const addTo = (face, offsetX, offsetY) => {
+      const addTo = (face, monitorIndex) => {
+        const monitor = monitors[monitorIndex];
+        const clone = rectInside(frame, monitor) ?
+          createFaceClone(actor, actor.x - monitor.x, actor.y - monitor.y) :
+          createMonitorClippedClone(actor, monitor);
+        if (!clone) {
+          return;
+        }
         const parent = isDesktop ? face._desktop : face._windows;
-        parent.add_child(createFaceClone(actor, actor.x - offsetX, actor.y - offsetY));
-        if (!isDesktop) {
+        parent.add_child(clone);
+        // Cinnamon hides a monitor's panels for the topmost window of that monitor only.
+        if (!isDesktop && monitorIndex === ownIndex) {
           face._topWindow = window;
         }
       };
 
-      // On a static monitor everything simply stays where it is.
-      if (!isRotating(monitorIndex)) {
-        addTo(layer.faces[0], monitor.x, monitor.y);
-        return;
-      }
-
       // The window being dragged to the new workspace, and windows on all workspaces,
-      // don't rotate. This matches what Cinnamon's own animation does.
-      const moving = window === Main.wm._movingWindow || window === this._draggedWindow;
-      if (moving || (!isDesktop && window.is_on_all_workspaces())) {
+      // don't rotate. This matches what Cinnamon's own animation does. They are drawn
+      // once, whole and flat above the cubes, so they need no clipping.
+      const moving = window === anim.movingWindow || window === this._draggedWindow;
+      const sticky = !isDesktop && window.is_on_all_workspaces();
+      if ((moving || sticky) && targets.some(isRotating)) {
         const clone = new Clutter.Clone({source: actor, x: actor.x, y: actor.y});
         overlay.add_child(clone);
         // A window that is dragged with the mouse keeps moving during the rotation.
@@ -1026,17 +1130,19 @@ class DesktopCube {
         return;
       }
 
-      // Nemo's desktop window is on all workspaces; give every face a copy.
-      if (isDesktop) {
-        layer.faces.forEach(face => addTo(face, monitor.x, monitor.y));
-        return;
-      }
-
       const workspace = window.get_workspace();
-      const face = workspace ? layer.faces[workspace.index()] : null;
-      if (face) {
-        addTo(face, monitor.x, monitor.y);
-      }
+      targets.forEach(index => {
+        const layer = layers[index];
+        if (!isRotating(index)) {
+          // On a static monitor everything simply stays where it is.
+          addTo(layer.faces[0], index);
+        } else if (isDesktop) {
+          // Nemo's desktop window is on all workspaces; give every face a copy.
+          layer.faces.forEach(face => addTo(face, index));
+        } else if (workspace && layer.faces[workspace.index()]) {
+          addTo(layer.faces[workspace.index()], index);
+        }
+      });
     });
 
     // Desklets are on every workspace and live in a container that Muffin keeps inside
@@ -1134,8 +1240,10 @@ class DesktopCube {
       below = this._getTopmostPanelActor() || below;
     }
     Main.uiGroup.insert_child_above(root, below);
-    Meta.disable_unredirect_for_display(global.display);
-    anim.unredirectDisabled = true;
+    if (!anim.unredirectDisabled) {   // A rebuilt scene keeps the first call.
+      Meta.disable_unredirect_for_display(global.display);
+      anim.unredirectDisabled = true;
+    }
     global.window_group.hide();
   }
 
@@ -1299,7 +1407,14 @@ class DesktopCube {
     const faceAngle = this._getFaceAngle(anim.nWorkspaces);
     const camera = this._getCamera();
 
-    anim.followers.forEach(f => f.clone.set_position(f.actor.x, f.actor.y));
+    // A window being moved to the new workspace stays in front of the cube; it turns
+    // partly see-through while the cube moves (fade follows the motion: 0 at rest).
+    const seeThrough = this._settings.getValue('moving-window-transparency') / 100;
+    const followerOpacity = Math.round(255 * (1 - seeThrough * anim.fade));
+    anim.followers.forEach(f => {
+      f.clone.set_position(f.actor.x, f.actor.y);
+      f.clone.opacity = followerOpacity;
+    });
 
     if (anim.skyLayer && this._skybox && this._skybox.actor.get_parent() === anim.skyLayer) {
       this._skybox.setRotation(progress, pitch, anim.nWorkspaces);
