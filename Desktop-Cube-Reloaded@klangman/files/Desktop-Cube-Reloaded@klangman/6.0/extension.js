@@ -54,15 +54,31 @@
 const Clutter = imports.gi.Clutter;
 const Cogl = imports.gi.Cogl;
 const GdkPixbuf = imports.gi.GdkPixbuf;
+const Gettext = imports.gettext;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const Graphene = imports.gi.Graphene;
 const Meta = imports.gi.Meta;
+const St = imports.gi.St;
 const PointerTracker = imports.misc.pointerTracker;
 const HotCorner = imports.ui.hotCorner;
 const Main = imports.ui.main;
+const MessageTray = imports.ui.messageTray;
 const Settings = imports.ui.settings;
 const Signals = imports.signals;
+const Util = imports.misc.util;
+
+const UUID = 'Desktop-Cube-Reloaded@klangman';
+
+// Translation support: look in the extension's own catalog first, then fall back to
+// Cinnamon's. Strings with something filled in use "%s" and .format() rather than
+// template literals, so xgettext can extract them and translators can move the value.
+Gettext.bindtextdomain(UUID, GLib.get_home_dir() + '/.local/share/locale');
+
+function _(text) {
+  const translated = Gettext.dgettext(UUID, text);
+  return translated !== text ? translated : window._(text);
+}
 
 // Workspaces are laid out in a single row, so vertical switches are left to Cinnamon.
 const NOOP_DIRECTIONS = [Meta.MotionDirection.UP, Meta.MotionDirection.DOWN];
@@ -327,10 +343,16 @@ class DesktopCube {
                         () => this._edgeSwitch && this._edgeSwitch.update(true));
 
     this._skybox = null;
-    this._settings.bind('enable-panorama', 'enablePanorama', () => this._updateSkybox());
+    this._settings.bind('enable-panorama', 'enablePanorama', () => this._updateSkybox(true));
     this._settings.bind('background-panorama', 'backgroundPanorama',
-                        () => this._updateSkybox());
-    this._updateSkybox();
+                        () => this._updateSkybox(true));
+    this._updateSkybox(false);
+
+    // The first time the extension runs, explain how to use it.
+    if (this._settings.getValue('new-install')) {
+      this._settings.setValue('new-install', false);
+      this._showWelcome();
+    }
   }
 
   disable() {
@@ -371,9 +393,58 @@ class DesktopCube {
     if (this._settings) {
       // Sync the gap setting again the next time the extension is enabled.
       this._settings.setValue('gap-synced', false);
+      // If the extension is being removed rather than reloaded, show the welcome
+      // notification again should the user ever add it back.
+      if (new Error().stack.includes('unloadRemovedExtensions@')) {
+        this._settings.setValue('new-install', true);
+      }
       this._settings.finalize();
       this._settings = null;
     }
+  }
+
+  // A notification telling a new user what the extension does and how to rotate the
+  // cube freely, with a button that opens the settings dialog.
+  _showWelcome() {
+    const source = new MessageTray.Source(this._meta.name);
+    const params = {};
+    // With "multiversion" the metadata path is the version folder; icon.png is one up.
+    for (const dir of [this._meta.path, GLib.path_get_dirname(this._meta.path)]) {
+      const file = Gio.File.new_for_path(GLib.build_filenamev([dir, 'icon.png']));
+      if (file.query_exists(null)) {
+        params.icon = new St.Icon({gicon: new Gio.FileIcon({file}), icon_size: source.ICON_SIZE});
+        break;
+      }
+    }
+    // The hold-to-rotate shortcut as the user has it set, e.g. "<Super><Alt>space"
+    // becomes "Super+Alt+Space". Only the first binding is shown.
+    const binding = (this._settings.getValue('cube-shortcut') || '').split('::')[0];
+    const shortcut = binding.replace(/<(Primary|Control)>/g, 'Ctrl+')
+                            .replace(/<(\w+)>/g, '$1+')
+                            .replace(/\+(\w)/g, (m, c) => '+' + c.toUpperCase());
+    const howToSpin = shortcut ?
+      _('To spin the cube freely, drag an empty part of a panel with the left mouse ' +
+        'button, or hold %s and move the mouse.').format(shortcut) :
+      _('To spin the cube freely, drag an empty part of a panel with the left mouse button.');
+    const body = [
+      _('Switching workspaces now rotates your desktop as the faces of a 3D cube.'),
+      howToSpin + ' ' +
+      _('Move sideways to rotate, up or down to tilt, and scroll to zoom. Let go to ' +
+        'switch to the workspace facing you, or press Esc to go back.'),
+      _('In the settings you can also set a hot corner that starts free rotation, and ' +
+        'add a panorama image around the cube on the Background tab.'),
+    ].join('\n\n');
+    const notification = new MessageTray.Notification(source,
+      _('Welcome to Desktop Cube Reloaded'), body, params);
+    Main.messageTray.add(source);
+    notification.addButton('cube-settings', _('Open Desktop Cube Reloaded Settings'));
+    notification.connect('action-invoked', (self, id) => {
+      if (id === 'cube-settings') {
+        Util.spawnCommandLineAsync('xlet-settings extension ' + this._meta.uuid);
+      }
+    });
+    notification.setUrgency(MessageTray.Urgency.CRITICAL);
+    source.notify(notification);
   }
 
   // Copies Cinnamon's "Allow cycling through workspaces" to our gap setting (inverted).
@@ -387,16 +458,17 @@ class DesktopCube {
 
   // (Re)loads the panorama when its settings change. The cube shown right now (if any)
   // keeps its old background; the new one is used from the next rotation on.
-  _updateSkybox() {
+  // `notifyWhenReady` is set when the user changed the settings, so they hear when the
+  // new panorama is ready; at startup the panorama loads quietly.
+  _updateSkybox(notifyWhenReady) {
     if (this._skybox) {
-      this._detachSkybox(this._anim);
       this._skybox.destroy();
       this._skybox = null;
     }
 
     const file = this._settings.getValue('background-panorama');
     if (this._settings.getValue('enable-panorama') && file) {
-      this._skybox = new Skybox(file, this._meta.uuid);
+      this._skybox = new Skybox(file, this._meta.uuid, notifyWhenReady);
     }
   }
 
@@ -543,6 +615,29 @@ class DesktopCube {
       this._switchCounted = true;
       this._playSwitchFeedback();
       return;
+    }
+
+    // Cinnamon 6.8 added trackpad swipes that slide the workspaces under the fingers
+    // (Main.wm.workspaceAnimation) and activate the new workspace only once the slide
+    // has settled. Cinnamon's own _switchWorkspace() takes care of two cases, and so
+    // must we. Older versions don't have workspaceAnimation.
+    const swipe = Main.wm.workspaceAnimation;
+    if (swipe) {
+      // This switch comes from a swipe that already animated it; rotating the cube now
+      // would show the same switch a second time. Cinnamon's code just completes it.
+      if (swipe.gestureActive) {
+        this._finish();
+        this._switchCounted = true;   // Cinnamon's own code completes it.
+        this._origSwitch.call(Main.wm, cinnamonwm, from, to, direction);
+        return;
+      }
+      // Something else switched workspaces during a swipe that still follows the
+      // fingers. Drop the swipe, or its clones stay on screen next to the cube. That
+      // shows the window group again, which has to stay hidden while the cube is up.
+      swipe.cancelSwitchAnimation();
+      if (this._anim) {
+        global.window_group.hide();
+      }
     }
 
     // Leave everything we don't handle to Cinnamon's own implementation. That includes
@@ -833,12 +928,12 @@ class DesktopCube {
   // the running animation. Used when the windows that stay in place change mid-turn.
   _rebuildScene(movingWindow) {
     const anim = this._anim;
-    this._detachSkybox(anim);
     if (anim.root) {
       anim.root.destroy();
     }
     anim.root = null;
     anim.skyLayer = null;
+    anim.skybox = null;
     anim.cubes = [];
     anim.followers = [];
     if (anim.cubeNotified) {
@@ -949,8 +1044,6 @@ class DesktopCube {
       anim.timeline.stop();
     });
 
-    // The skybox is kept between rotations, so take it out before destroying the scene.
-    step(() => this._detachSkybox(anim));
     step(() => {
       if (anim.root) {
         anim.root.destroy();
@@ -1008,16 +1101,14 @@ class DesktopCube {
     // The panorama, if any, is painted first, behind everything else. All monitors'
     // panoramas share one layer below all cubes, so a cube that swings past the edge of
     // its monitor still covers the neighbor's panorama. Each rotating monitor shows a
-    // clone of the skybox, centered on that monitor's camera. The skybox itself is made
-    // invisible with opacity 0 rather than hidden: Clutter doesn't lay out hidden actors,
-    // so its tiles would have no size and the clones would draw nothing. Clones draw
-    // their source with their own opacity, so they are not affected.
+    // clone of the skybox, centered on that monitor's camera. The skybox itself is not
+    // part of the scene: it stays on the stage, invisible, for as long as it exists (see
+    // Skybox), and only its clones come and go with each rotation.
     const skybox = this._skybox && this._skybox.ready ? this._skybox : null;
+    anim.skybox = skybox;
     anim.skyLayer = new Clutter.Actor();
     root.add_child(anim.skyLayer);
     if (skybox) {
-      anim.skyLayer.add_child(skybox.actor);
-      skybox.actor.opacity = 0;
       skybox.placeAtCamera(this._getCamera());
     }
 
@@ -1416,8 +1507,10 @@ class DesktopCube {
       f.clone.opacity = followerOpacity;
     });
 
-    if (anim.skyLayer && this._skybox && this._skybox.actor.get_parent() === anim.skyLayer) {
-      this._skybox.setRotation(progress, pitch, anim.nWorkspaces);
+    // Only if the scene's clones show the current skybox: the panorama may have been
+    // changed or turned off while the cube is up.
+    if (anim.skybox && anim.skybox === this._skybox) {
+      anim.skybox.setRotation(progress, pitch, anim.nWorkspaces);
     }
 
     const faceOpacity = Math.round(255 * (1.0 - Math.abs(pitch)));
@@ -1441,6 +1534,7 @@ class DesktopCube {
         face.pivot_point_z = -centerDepth;
         face.rotation_angle_y = angle;
         face.translation_z = -depthOffset;
+        face._angle = angle;
 
         // The wallpaper fades out while the cube is tilted, so you can see inside it. The
         // desklets, desktop icons and panels are drawn flat on the wallpaper, so they fade
@@ -1483,6 +1577,13 @@ class DesktopCube {
   // and a point one pixel in front of it to stage coordinates; the face is front facing
   // if the camera is on the side that point lies on.
   _isFrontFacing(face, camera) {
+    // Right after the scene is built nothing has been allocated yet, and the transforms
+    // below come out wrong (seen on Cinnamon 6.8): the front face was taken for one seen
+    // from behind, so its wallpaper was painted over its windows for the first frame.
+    // Until then, judge by the face's angle alone.
+    if (!face.has_allocation()) {
+      return Math.abs(face._angle || 0) < 90;
+    }
     const x = face.width / 2;
     const y = face.height / 2;
     const a = face.apply_relative_transform_to_point(null, new Graphene.Point3D({x, y, z: 0}));
@@ -1629,17 +1730,6 @@ class DesktopCube {
     return matrix;
   }
 
-  // Takes the skybox out of a scene that is about to be destroyed, so it can be reused.
-  _detachSkybox(anim) {
-    if (!anim || !anim.skyLayer || !this._skybox) {
-      return;
-    }
-    if (this._skybox.actor.get_parent() === anim.skyLayer) {
-      anim.skyLayer.remove_child(this._skybox.actor);
-      this._skybox.actor.opacity = 255;
-    }
-  }
-
   // While rotating, the cube moves back and the windows float in front of the faces.
   // Both effects are zero when facing a workspace. They are small for horizontal
   // rotations, so switching isn't obtrusive, and strong when the cube is tilted.
@@ -1758,8 +1848,9 @@ function gioAsync(obj, name, ...args) {
 }
 
 class Skybox {
-  constructor(file, uuid) {
+  constructor(file, uuid, notifyWhenReady = false) {
     this._uuid = uuid;
+    this._notifyWhenReady = notifyWhenReady;
     this.ready = false;
     this._destroyed = false;
     this._idleID = 0;
@@ -1770,7 +1861,18 @@ class Skybox {
 
     // The scene shows clones of this actor, one per monitor. It gets a size of 1x1 so
     // that clones of the same size draw it without any scaling.
-    this.actor = new Clutter.Actor({name: 'desktop-cube-reloaded-skybox', width: 1, height: 1});
+    //
+    // The actor itself is never shown. It sits at the bottom of the stage from now until
+    // destroy(), with opacity 0: Clutter skips such an actor when painting, while clones
+    // draw their source with their own opacity. It is not hidden instead, because Clutter
+    // doesn't lay out hidden actors, so the tiles would have no size and the clones would
+    // draw nothing. And it is not taken off the stage between rotations: on Cinnamon 6.8
+    // Wayland a skybox that had been removed and added again was no longer drawn, so the
+    // panorama only showed during the first rotation.
+    this.actor = new Clutter.Actor({
+      name: 'desktop-cube-reloaded-skybox', width: 1, height: 1, opacity: 0,
+    });
+    global.stage.insert_child_below(this.actor, null);
     this._tilt = new Clutter.Actor();
     this._spin = new Clutter.Actor();
     this.actor.add_child(this._tilt);
@@ -1874,15 +1976,26 @@ class Skybox {
     return GLib.build_filenamev([this._cacheDir, name]);
   }
 
+  // All six faces are in place, from the cache or freshly converted.
+  _setReady() {
+    this.ready = true;
+    if (this._notifyWhenReady) {
+      Main.notify(
+        _('Desktop Cube Reloaded: the panorama is ready'),
+        _('"%s" has been loaded and will be shown around the cube the next time it ' +
+          'rotates.').format(this._name));
+    }
+  }
+
   _fail(error) {
     if (this._destroyed) {
       return;  // Cancelled by destroy().
     }
     global.logError(`${this._uuid}: could not load panorama ${this._file}: ${error}`);
     Main.warningNotify(
-      'Desktop Cube Reloaded: the panorama could not be loaded',
-      `"${this._name}" could not be read as an image. Use a JPEG or PNG file. The cube is ` +
-      'shown on black for now.');
+      _('Desktop Cube Reloaded: the panorama could not be loaded'),
+      _('"%s" could not be read as an image. Use a JPEG or PNG file. The cube is shown ' +
+        'on black for now.').format(this._name));
   }
 
   // Loads face `index` from the cache, then the next one. Falls back to converting the
@@ -1892,7 +2005,7 @@ class Skybox {
       return;
     }
     if (index === SKY_FACES.length) {
-      this.ready = true;
+      this._setReady();
       return;
     }
 
@@ -1967,9 +2080,10 @@ class Skybox {
         const aspect = pixbuf.width / pixbuf.height;
         if (Math.abs(aspect - 2) > 0.05) {
           Main.warningNotify(
-            'Desktop Cube Reloaded: the panorama has an unusual shape',
-            `"${this._name}" is ${pixbuf.width} × ${pixbuf.height} pixels. A 360° ` +
-            'panorama should be twice as wide as it is high, otherwise it looks stretched.');
+            _('Desktop Cube Reloaded: the panorama has an unusual shape'),
+            _('"%s" is %d × %d pixels. A 360° panorama should be twice as wide as it is ' +
+              'high, otherwise it looks stretched.').format(this._name, pixbuf.width,
+                                                            pixbuf.height));
         }
 
         try {
@@ -2050,7 +2164,7 @@ class Skybox {
     this._idleID = 0;
     this._source = null;
     this._facePixels = null;
-    this.ready = true;
+    this._setReady();
     return GLib.SOURCE_REMOVE;
   }
 

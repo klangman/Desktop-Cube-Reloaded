@@ -55,6 +55,7 @@
             "keys": [
                 "enable-panorama",
                 "background-panorama",
+                "panorama-ready-info",
                 "panorama-info"
             ]
         },
@@ -325,6 +326,13 @@
         "default": true,
         "description": "Spread the windows apart when the cube is tilted"
     },
+    "panorama-ready-info": {
+        "type": "custom",
+        "file": "CustomWidgets.py",
+        "widget": "LabelWithTooltip",
+        "description": "After you pick a new panorama, a notification lets you know when it is ready to be shown around the cube.",
+        "dependency": "enable-panorama"
+    },
     "panorama-info": {
         "type": "custom",
         "file": "CustomWidgets.py",
@@ -408,6 +416,10 @@
     "gap-synced": {
         "type": "generic",
         "default": false
+    },
+    "new-install": {
+        "type": "generic",
+        "default": true
     },
     "about-text": {
         "type": "custom",
