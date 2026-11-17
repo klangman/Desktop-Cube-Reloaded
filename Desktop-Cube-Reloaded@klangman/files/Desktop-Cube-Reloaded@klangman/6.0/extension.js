@@ -52,12 +52,14 @@
 // workspace, taking a dragged window along, or starts free rotation (see EdgeSwitch).
 
 const Clutter = imports.gi.Clutter;
+const ExtensionSystem = imports.ui.extensionSystem;
 const Cogl = imports.gi.Cogl;
 const GdkPixbuf = imports.gi.GdkPixbuf;
 const Gettext = imports.gettext;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const Graphene = imports.gi.Graphene;
+const Extension = imports.ui.extension;
 const Meta = imports.gi.Meta;
 const St = imports.gi.St;
 const PointerTracker = imports.misc.pointerTracker;
@@ -79,6 +81,11 @@ function _(text) {
   const translated = Gettext.dgettext(UUID, text);
   return translated !== text ? translated : window._(text);
 }
+
+// Extensions that also replace Cinnamon's workspace switch animation. They patch the
+// same functions and react to the same events as we do, so if one of them is already
+// running when we are enabled, we do nothing at all (see _findConflicts).
+const CONFLICTING_EXTENSIONS = ['DesktopCube@yare', 'Flipper@connerdev'];
 
 // Workspaces are laid out in a single row, so vertical switches are left to Cinnamon.
 const NOOP_DIRECTIONS = [Meta.MotionDirection.UP, Meta.MotionDirection.DOWN];
@@ -107,6 +114,11 @@ const HOT_CORNER_ACTIONS = {
   LEFT: 'cube-rotate-left',
   RIGHT: 'cube-rotate-right',
 };
+
+// Our settings that remember what Cinnamon had in each corner before a cube action was
+// picked for it, in the order of Cinnamon's hotcorner-layout setting.
+const HOT_CORNER_KEYS = ['hot-corner-top-left', 'hot-corner-top-right',
+                         'hot-corner-bottom-left', 'hot-corner-bottom-right'];
 
 // Scroll zoom, as fractions of the monitor width: per wheel click, and the limits.
 const ZOOM_STEP = 0.1;
@@ -264,11 +276,23 @@ class DesktopCube {
     this._meta = metadata;
     this._anim = null;
     this._drag = null;
+    this._blocked = false;
   }
 
   // ------------------------------------------------------------------------ lifecycle
 
   enable() {
+    // Refuse to run next to an extension we would fight with. Nothing has been set up
+    // at this point, so disable() has nothing to undo either.
+    const conflicts = this._findConflicts();
+    this._blocked = conflicts.length > 0;
+    if (this._blocked) {
+      global.logWarning(`${this._meta.uuid}: not starting, conflicting extension(s) ` +
+                        `already loaded: ${conflicts.map(c => c.uuid).join(', ')}`);
+      this._showConflict(conflicts.map(c => c.name));
+      return;
+    }
+
     this._settings = new Settings.ExtensionSettings(this, this._meta.uuid);
 
     // The About tab of the settings dialog shows this.
@@ -346,6 +370,24 @@ class DesktopCube {
     this._settings.bind('enable-panorama', 'enablePanorama', () => this._updateSkybox(true));
     this._settings.bind('background-panorama', 'backgroundPanorama',
                         () => this._updateSkybox(true));
+    this._settings.bind('background-mode', 'backgroundMode',
+                        () => this._updateSkybox(true));
+    // Every new brightness converts the panorama again, so wait until the value has
+    // stopped changing (e.g. while the spin button's arrow is held).
+    this._skyboxTimer = 0;
+    this._settings.bind('panorama-brightness', 'panoramaBrightness', () => {
+      if (this._skyboxTimer) {
+        GLib.source_remove(this._skyboxTimer);
+      }
+      this._skyboxTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+        this._skyboxTimer = 0;
+        // Only the panorama uses the brightness.
+        if (this._skybox && !this._skybox.flat) {
+          this._updateSkybox(true);
+        }
+        return GLib.SOURCE_REMOVE;
+      });
+    });
     this._updateSkybox(false);
 
     // The first time the extension runs, explain how to use it.
@@ -356,6 +398,26 @@ class DesktopCube {
   }
 
   disable() {
+    // Cinnamon also calls disable() when it reloads the extension (an update, or the
+    // reload button in Looking Glass), but not when it shuts down or restarts. Only
+    // unloadRemovedExtensions() means the user took the extension out.
+    const removed = new Error().stack.includes('unloadRemovedExtensions@');
+
+    if (this._blocked) {
+      // enable() bailed out before changing anything. The hot corners may still hold
+      // cube actions from an earlier session, though.
+      this._blocked = false;
+      if (removed) {
+        try {
+          const settings = new Settings.ExtensionSettings(this, this._meta.uuid);
+          this._restoreHotCorners(settings);
+          settings.finalize();
+        } catch (e) {
+          global.logError(`${this._meta.uuid}: could not restore the hot corners: ${e}`);
+        }
+      }
+      return;
+    }
     Main.keybindingManager.removeHotKey(SHORTCUT_NAME);
     this._unpatchHotCorners();
     this._drag.destroy();
@@ -367,6 +429,10 @@ class DesktopCube {
     this._draggedWindow = null;
     this._finish();
 
+    if (this._skyboxTimer) {
+      GLib.source_remove(this._skyboxTimer);
+      this._skyboxTimer = 0;
+    }
     if (this._skybox) {
       this._skybox.destroy();
       this._skybox = null;
@@ -394,28 +460,80 @@ class DesktopCube {
       // Sync the gap setting again the next time the extension is enabled.
       this._settings.setValue('gap-synced', false);
       // If the extension is being removed rather than reloaded, show the welcome
-      // notification again should the user ever add it back.
-      if (new Error().stack.includes('unloadRemovedExtensions@')) {
+      // notification again should the user ever add it back, and give the hot corners
+      // that run a cube action back to Cinnamon.
+      if (removed) {
         this._settings.setValue('new-install', true);
+        this._restoreHotCorners(this._settings);
       }
       this._settings.finalize();
       this._settings = null;
     }
   }
 
+  // The conflicting extensions (see CONFLICTING_EXTENSIONS) that are running right now,
+  // as [{uuid, name}]. Cinnamon adds an extension to runningExtensions once its enable()
+  // has returned, so this finds the ones that were loaded before us. An extension loaded
+  // after us is not noticed; it is up to that one to step aside.
+  _findConflicts() {
+    const conflicts = [];
+    try {
+      const running = ExtensionSystem.runningExtensions || [];
+      for (const uuid of CONFLICTING_EXTENSIONS) {
+        if (!running.includes(uuid)) {
+          continue;
+        }
+        const extension = Extension.getExtension(uuid);
+        const name = extension && extension.meta && extension.meta.name;
+        conflicts.push({uuid, name: name || uuid});
+      }
+    } catch (e) {
+      global.logError(`${this._meta.uuid}: could not check for conflicting extensions: ${e}`);
+    }
+    return conflicts;
+  }
+
+  // A notification telling the user why the cube is not working: `names` are the
+  // conflicting extensions that were loaded before us.
+  _showConflict(names) {
+    const body = [
+      _('Desktop Cube Reloaded can not be used together with: %s')
+        .format(names.join(', ')),
+      _('Both change how Cinnamon switches workspaces, so Desktop Cube Reloaded will ' +
+        'do nothing until the other extension is removed. After removing it, disable ' +
+        'Desktop Cube Reloaded and enable it again.'),
+    ].join('\n\n');
+    const [source, notification] =
+      this._createNotification(_('Desktop Cube Reloaded is not running'), body);
+    notification.addButton('extensions', _('Open Extensions Settings'));
+    notification.connect('action-invoked', (self, id) => {
+      if (id === 'extensions') {
+        Util.spawn(['cinnamon-settings', 'extensions']);
+      }
+    });
+    notification.setUrgency(MessageTray.Urgency.CRITICAL);
+    source.notify(notification);
+  }
+
+  // Returns [source, notification] for a notification with our icon. The caller adds
+  // buttons as needed and shows it with source.notify(notification).
+  _createNotification(title, body) {
+    const source = new MessageTray.Source(this._meta.name);
+    const params = {};
+    // With "multiversion" the metadata path is the version folder (e.g. ".../6.0");
+    // icon.png is one up.
+    const dir = /^\d+(\.\d+)+$/.test(GLib.path_get_basename(this._meta.path)) ?
+      GLib.path_get_dirname(this._meta.path) : this._meta.path;
+    const file = Gio.File.new_for_path(GLib.build_filenamev([dir, 'icon.png']));
+    params.icon = new St.Icon({gicon: new Gio.FileIcon({file}), icon_size: source.ICON_SIZE});
+    const notification = new MessageTray.Notification(source, title, body, params);
+    Main.messageTray.add(source);
+    return [source, notification];
+  }
+
   // A notification telling a new user what the extension does and how to rotate the
   // cube freely, with a button that opens the settings dialog.
   _showWelcome() {
-    const source = new MessageTray.Source(this._meta.name);
-    const params = {};
-    // With "multiversion" the metadata path is the version folder; icon.png is one up.
-    for (const dir of [this._meta.path, GLib.path_get_dirname(this._meta.path)]) {
-      const file = Gio.File.new_for_path(GLib.build_filenamev([dir, 'icon.png']));
-      if (file.query_exists(null)) {
-        params.icon = new St.Icon({gicon: new Gio.FileIcon({file}), icon_size: source.ICON_SIZE});
-        break;
-      }
-    }
     // The hold-to-rotate shortcut as the user has it set, e.g. "<Super><Alt>space"
     // becomes "Super+Alt+Space". Only the first binding is shown.
     const binding = (this._settings.getValue('cube-shortcut') || '').split('::')[0];
@@ -434,13 +552,12 @@ class DesktopCube {
       _('In the settings you can also set a hot corner that starts free rotation, and ' +
         'add a panorama image around the cube on the Background tab.'),
     ].join('\n\n');
-    const notification = new MessageTray.Notification(source,
-      _('Welcome to Desktop Cube Reloaded'), body, params);
-    Main.messageTray.add(source);
+    const [source, notification] =
+      this._createNotification(_('Welcome to Desktop Cube Reloaded'), body);
     notification.addButton('cube-settings', _('Open Desktop Cube Reloaded Settings'));
     notification.connect('action-invoked', (self, id) => {
       if (id === 'cube-settings') {
-        Util.spawnCommandLineAsync('xlet-settings extension ' + this._meta.uuid);
+        Util.spawn(['xlet-settings', 'extension', this._meta.uuid]);
       }
     });
     notification.setUrgency(MessageTray.Urgency.CRITICAL);
@@ -461,6 +578,10 @@ class DesktopCube {
   // `notifyWhenReady` is set when the user changed the settings, so they hear when the
   // new panorama is ready; at startup the panorama loads quietly.
   _updateSkybox(notifyWhenReady) {
+    if (this._skyboxTimer) {
+      GLib.source_remove(this._skyboxTimer);
+      this._skyboxTimer = 0;
+    }
     if (this._skybox) {
       this._skybox.destroy();
       this._skybox = null;
@@ -468,7 +589,13 @@ class DesktopCube {
 
     const file = this._settings.getValue('background-panorama');
     if (this._settings.getValue('enable-panorama') && file) {
-      this._skybox = new Skybox(file, this._meta.uuid, notifyWhenReady);
+      // Either a 360° panorama around the cube, or an ordinary picture scaled to the
+      // screen. Both offer the same interface to the scene.
+      const mode = this._settings.getValue('background-mode');
+      this._skybox = BACKDROP_MODES.includes(mode) ?
+        new Backdrop(file, mode, this._meta.uuid, notifyWhenReady) :
+        new Skybox(file, this._meta.uuid, notifyWhenReady,
+                   (this._settings.getValue('panorama-brightness') || 100) / 100);
     }
   }
 
@@ -569,6 +696,42 @@ class DesktopCube {
     this._hotCornerProto = null;
     this._hotCornerRunAction = null;
     this._origRunAction = null;
+  }
+
+  // Called when the extension is removed. Every corner that is set to a cube action
+  // right now goes back to what Cinnamon had there before (kept in our hot-corner-*
+  // settings by the settings dialog, see HotCornerChooser in CustomWidgets.py), or to
+  // Cinnamon's default if nothing was saved. Without this, Cinnamon would try to run the
+  // cube action names as shell commands. Corners that don't hold a cube action, and so
+  // the whole setting if none does, are left alone.
+  _restoreHotCorners(settings) {
+    try {
+      const cinnamon = new Gio.Settings({schema_id: 'org.cinnamon'});
+      const layout = cinnamon.get_strv('hotcorner-layout');
+      if (layout.length !== HOT_CORNER_KEYS.length) {
+        return;
+      }
+      const defaultValue = cinnamon.get_default_value('hotcorner-layout');
+      const defaults = defaultValue ? defaultValue.deep_unpack() : [];
+      const cubeActions = Object.values(HOT_CORNER_ACTIONS);
+
+      let changed = false;
+      HOT_CORNER_KEYS.forEach((key, i) => {
+        // "action:enabled:delay"; the action (a command) may itself contain ':'.
+        const match = /^(.*):([^:]*):[^:]*$/.exec(layout[i]);
+        if (!match || match[2] !== 'true' || !cubeActions.includes(match[1])) {
+          return;
+        }
+        layout[i] = settings.getValue(key) || defaults[i] || 'expo:false:0';
+        settings.setValue(key, '');
+        changed = true;
+      });
+      if (changed) {
+        cinnamon.set_strv('hotcorner-layout', layout);
+      }
+    } catch (e) {
+      global.logError(`${this._meta.uuid}: could not restore the hot corners: ${e}`);
+    }
   }
 
   // Returns true if `action` is one of ours.
@@ -1132,7 +1295,10 @@ class DesktopCube {
         root.add_child(wrapper);
         anim.cubes.push({monitor: monitor, monitorIndex: index, actor: cube, faces: faces});
 
-        if (skybox) {
+        if (skybox && skybox.flat) {
+          // An ordinary picture: it fills the monitor and stays put behind the cube.
+          anim.skyLayer.add_child(skybox.createActor(monitor));
+        } else if (skybox) {
           const clip = new Clutter.Actor();
           clip.set_clip(monitor.x, monitor.y, monitor.width, monitor.height);
           const skyWrapper = new Clutter.Actor();
@@ -1796,7 +1962,8 @@ class DesktopCube {
 // exist.
 //
 // The finished faces are saved as PNG files in ~/.cache/desktop-cube-reloaded/<key>/,
-// where the key depends on the panorama's path, size and modification time. Next time
+// where the key depends on the panorama's path, size, modification time and the
+// brightness setting. Next time
 // (e.g. after logging in), the faces are simply loaded from there. Only the cache for
 // the current panorama is kept.
 const SKY_FACE_TILES = 8;
@@ -1848,8 +2015,12 @@ function gioAsync(obj, name, ...args) {
 }
 
 class Skybox {
-  constructor(file, uuid, notifyWhenReady = false) {
+  constructor(file, uuid, notifyWhenReady = false, brightness = 1) {
+    this.flat = false;
     this._uuid = uuid;
+    // Every pixel is multiplied by this when the panorama is converted. Dark images,
+    // such as high-resolution star maps, show more that way.
+    this._brightness = brightness;
     this._notifyWhenReady = notifyWhenReady;
     this.ready = false;
     this._destroyed = false;
@@ -1939,7 +2110,8 @@ class Skybox {
       const key = GLib.compute_checksum_for_string(
         GLib.ChecksumType.SHA256,
         [SKY_CACHE_VERSION, gfile.get_uri(), info.get_attribute_uint64('time::modified'),
-         info.get_size(), SKY_MAX_FACE_SIZE, SKY_FACE_TILES].join('|'),
+         info.get_size(), SKY_MAX_FACE_SIZE, SKY_FACE_TILES,
+         this._brightness.toFixed(2)].join('|'),
         -1);
       this._cacheRoot = GLib.build_filenamev([GLib.get_user_cache_dir(), SKY_CACHE_DIR]);
       this._cacheDir = GLib.build_filenamev([this._cacheRoot, key]);
@@ -2351,6 +2523,7 @@ class Skybox {
 
     const p = src.pixels;
     const c = src.channels;
+    const gain = this._brightness;
     const i00 = ya * src.rowstride + xa * c;
     const i10 = ya * src.rowstride + xb * c;
     const i01 = yb * src.rowstride + xa * c;
@@ -2359,8 +2532,151 @@ class Skybox {
     for (let k = 0; k < 3; k++) {
       const top = p[i00 + k] + (p[i10 + k] - p[i00 + k]) * wx;
       const bottom = p[i01 + k] + (p[i11 + k] - p[i01 + k]) * wx;
-      out[offset + k] = top + (bottom - top) * wy;
+      // Clamped: a Uint8Array would wrap values above 255 around.
+      out[offset + k] = Math.min(255, (top + (bottom - top) * wy) * gain);
     }
+  }
+}
+
+// ------------------------------------------------------------- flat background picture
+//
+// The alternative to the panorama, for ordinary pictures such as a 1920 × 1080 photo or
+// a wallpaper: the picture is scaled to each rotating monitor and stays put behind the
+// cube, like a wallpaper behind the whole scene. Wrapped around the cube as a panorama,
+// such a picture would be stretched over 360° and look blurry and distorted.
+//
+// Modes (the 'background-mode' setting; anything else means panorama):
+//   zoom    - scaled to cover the monitor, keeping its shape; the overhang is cut off
+//   fit     - scaled to fit inside the monitor, keeping its shape; the rest stays black
+//   stretch - stretched to exactly the monitor's size
+//
+// It has the same interface as Skybox as far as the scene is concerned (ready, flat,
+// placeAtCamera(), setRotation(), destroy()), plus createActor().
+const BACKDROP_MODES = ['zoom', 'fit', 'stretch'];
+const BACKDROP_MIN_TEXTURE_LIMIT = 4096;
+
+class Backdrop {
+  constructor(file, mode, uuid, notifyWhenReady = false) {
+    this.flat = true;
+    this.ready = false;
+    this._mode = mode;
+    this._uuid = uuid;
+    this._notifyWhenReady = notifyWhenReady;
+    this._destroyed = false;
+    this._cancellable = new Gio.Cancellable();  // Stops file I/O on destroy.
+    this._image = null;
+    this._width = 0;
+    this._height = 0;
+
+    // The settings widget may store a URI or a plain path.
+    const gfile = file.startsWith('file://') ?
+      Gio.File.new_for_uri(file) : Gio.File.new_for_path(file);
+    this._name = gfile.get_basename() || file;
+    this._file = file;
+    this._load(gfile);
+  }
+
+  // Actors made by createActor() belong to the scene and keep the image alive for as
+  // long as they need it.
+  destroy() {
+    this._destroyed = true;
+    this._cancellable.cancel();
+    this._image = null;
+  }
+
+  // The picture doesn't move with the cube.
+  placeAtCamera(camera) {}
+  setRotation(progress, pitch, nWorkspaces) {}
+
+  // Returns an actor (in stage coordinates) showing the picture on the given monitor.
+  createActor(monitor) {
+    const clip = new Clutter.Actor();
+    clip.set_clip(monitor.x, monitor.y, monitor.width, monitor.height);
+
+    let width = monitor.width;
+    let height = monitor.height;
+    if (this._mode !== 'stretch') {
+      const sx = monitor.width / this._width;
+      const sy = monitor.height / this._height;
+      const scale = this._mode === 'fit' ? Math.min(sx, sy) : Math.max(sx, sy);
+      width = Math.round(this._width * scale);
+      height = Math.round(this._height * scale);
+    }
+
+    const picture = new Clutter.Actor({
+      x: monitor.x + Math.round((monitor.width - width) / 2),
+      y: monitor.y + Math.round((monitor.height - height) / 2),
+      width: width,
+      height: height,
+      content: this._image,
+    });
+    picture.set_content_scaling_filters(Clutter.ScalingFilter.TRILINEAR,
+                                        Clutter.ScalingFilter.LINEAR);
+    clip.add_child(picture);
+    return clip;
+  }
+
+  _load(gfile) {
+    gfile.read_async(GLib.PRIORITY_DEFAULT, this._cancellable, (obj, readResult) => {
+      let stream;
+      try {
+        stream = gfile.read_finish(readResult);
+      } catch (e) {
+        this._fail(e);
+        return;
+      }
+
+      GdkPixbuf.Pixbuf.new_from_stream_async(stream, this._cancellable, (obj2, result) => {
+        try {
+          let pixbuf = GdkPixbuf.Pixbuf.new_from_stream_finish(result);
+          if (this._destroyed) {
+            return;
+          }
+
+          // The picture becomes a single texture, so a very large one is scaled down
+          // to stay within what graphics cards accept. Nothing is lost on screen: the
+          // limit is never smaller than the screen.
+          const limit = Math.max(BACKDROP_MIN_TEXTURE_LIMIT, global.screen_width,
+                                 global.screen_height);
+          const shrink = Math.min(1, limit / pixbuf.width, limit / pixbuf.height);
+          if (shrink < 1) {
+            pixbuf = pixbuf.scale_simple(Math.max(1, Math.round(pixbuf.width * shrink)),
+                                         Math.max(1, Math.round(pixbuf.height * shrink)),
+                                         GdkPixbuf.InterpType.BILINEAR);
+          }
+
+          const image = new Clutter.Image();
+          image.set_data(pixbuf.get_pixels(),
+                         pixbuf.get_has_alpha() ? Cogl.PixelFormat.RGBA_8888 :
+                                                  Cogl.PixelFormat.RGB_888,
+                         pixbuf.width, pixbuf.height, pixbuf.rowstride);
+          this._image = image;
+          this._width = pixbuf.width;
+          this._height = pixbuf.height;
+          this.ready = true;
+          if (this._notifyWhenReady) {
+            Main.notify(
+              _('Desktop Cube Reloaded: the background image is ready'),
+              _('"%s" has been loaded and will be shown behind the cube the next time ' +
+                'it rotates.').format(this._name));
+          }
+        } catch (e) {
+          this._fail(e);
+        }
+      });
+    });
+  }
+
+  _fail(error) {
+    if (this._destroyed) {
+      return;  // Cancelled by destroy().
+    }
+    global.logError(`${this._uuid}: could not load background image ${this._file}: ` +
+                    `${error}`);
+    Main.warningNotify(
+      _('Desktop Cube Reloaded: the background image could not be loaded'),
+      _('"%s" could not be read as an image. Use a JPEG or PNG file. The cube is shown ' +
+        'on black for now.').format(this._name));
   }
 }
 
@@ -2584,7 +2900,7 @@ class EdgeSwitch {
     if ((mods & need) !== need) {
       return false;
     }
-    // Games and videos. (Check that Muffin 6.0 has this; mutter of that age does.)
+    // Games and videos.
     if (global.display.get_monitor_in_fullscreen(barrier._segment.monitor)) {
       return false;
     }
