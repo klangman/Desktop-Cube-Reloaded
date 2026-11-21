@@ -195,7 +195,7 @@ msgid "Window parallax"
 msgstr ""
 
 #. 6.0/settings-schema.json->window-parallax->tooltip
-msgid "How far windows float in front of the cube faces while it rotates. 0 keeps them flat on the faces."
+msgid "How far windows float in front of the cube faces while it rotates sideways. 0 keeps them flat on the faces. Tilting the cube up or down uses the \"Spread the windows apart when the cube is tilted\" option instead."
 msgstr ""
 
 #. 6.0/settings-schema.json->auto-zoom-out->description

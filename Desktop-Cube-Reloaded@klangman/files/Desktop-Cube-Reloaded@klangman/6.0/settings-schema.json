@@ -174,7 +174,7 @@
         "max": 1.0,
         "step": 0.05,
         "default": 0.5,
-        "tooltip": "How far windows float in front of the cube faces while it rotates. 0 keeps them flat on the faces.",
+        "tooltip": "How far windows float in front of the cube faces while it rotates sideways. 0 keeps them flat on the faces. Tilting the cube up or down uses the \"Spread the windows apart when the cube is tilted\" option instead.",
         "digits": 2
     },
     "auto-zoom-out": {

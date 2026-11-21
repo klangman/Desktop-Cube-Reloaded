@@ -1924,7 +1924,10 @@ class DesktopCube {
     // 0 when facing a workspace, 1 when looking at an edge / when fully tilted.
     const fraction = ((progress % 1) + 1) % 1;
     const hFactor = 1.0 - 2.0 * Math.abs(fraction - 0.5);
-    const vFactor = Math.abs(pitch);
+    // Eased in (smoothstep) so a slight, unintended tilt during a mouse drag doesn't lift
+    // the windows off the wallpaper; full tilt still gives the full effect.
+    const tilt = Math.abs(pitch);
+    const vFactor = tilt * tilt * (3 - 2 * tilt);
 
     // Horizontal: move back far enough that the cube's corners stay behind the screen
     // plane. The topmost window then stays at a constant depth.
