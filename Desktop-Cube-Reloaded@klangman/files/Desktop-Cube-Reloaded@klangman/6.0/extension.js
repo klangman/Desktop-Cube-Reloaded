@@ -1716,15 +1716,26 @@ class DesktopCube {
         });
       });
 
-      // Clutter has no depth buffer here, so paint order is depth order. Within a face,
-      // the windows are parallel planes: painting them in stacking order is right when
-      // the face is seen from the front, and has to be reversed when seen from behind.
+      // Clutter has no depth buffer here, so paint order is depth order. The wallpaper
+      // layers lie on the face's plane and the windows on parallel planes at translation_z
+      // in front of it. The wallpaper goes first when the face is seen from the front and
+      // last when seen from behind. The windows are painted farthest plane first, by their
+      // distance from the camera along the face's normal. A single front/back flip is not
+      // enough for them: at grazing angles the camera lies between the window planes, sees
+      // the lower windows from the front and the higher ones from behind. Planes on
+      // opposite sides of the camera never overlap on screen, so this order is always right.
       cube.faces.forEach(face => {
-        const frontFacing = this._isFrontFacing(face, camera);
+        const c = this._getCameraOffset(face, camera);
+        const frontFacing = c > 0;
         if (frontFacing !== face._frontFacing) {
           face._frontFacing = frontFacing;
           this._reverseChildren(face);
-          this._reverseChildren(face._windows);
+        }
+        const windows = face._windows.get_children();
+        const sortedWindows = windows.slice().sort((a, b) =>
+          Math.abs(c - b.translation_z) - Math.abs(c - a.translation_z));
+        if (sortedWindows.some((w, k) => w !== windows[k])) {
+          sortedWindows.forEach((w, k) => face._windows.set_child_at_index(w, k));
         }
       });
 
@@ -1739,23 +1750,32 @@ class DesktopCube {
     actor.get_children().reverse().forEach((child, k) => actor.set_child_at_index(child, k));
   }
 
-  // Whether the camera sees the front side of the face. We transform the face's center
-  // and a point one pixel in front of it to stage coordinates; the face is front facing
-  // if the camera is on the side that point lies on.
-  _isFrontFacing(face, camera) {
+  // Signed distance of the camera from the face's plane, in the face's own z units:
+  // positive in front of the face, negative behind it. A window clone with
+  // translation_z = d lies on the parallel plane at d. We transform the face's center and
+  // a point one unit in front of it to stage coordinates, and project the camera onto
+  // that normal.
+  _getCameraOffset(face, camera) {
     // Right after the scene is built nothing has been allocated yet, and the transforms
     // below come out wrong (seen on Cinnamon 6.8): the front face was taken for one seen
     // from behind, so its wallpaper was painted over its windows for the first frame.
-    // Until then, judge by the face's angle alone.
+    // Until then, judge by the face's angle alone. A camera far in front (or behind)
+    // gives plain stacking order (or its reverse).
     if (!face.has_allocation()) {
-      return Math.abs(face._angle || 0) < 90;
+      return Math.abs(face._angle || 0) < 90 ? 1e9 : -1e9;
     }
     const x = face.width / 2;
     const y = face.height / 2;
     const a = face.apply_relative_transform_to_point(null, new Graphene.Point3D({x, y, z: 0}));
     const b = face.apply_relative_transform_to_point(null, new Graphene.Point3D({x, y, z: 1}));
-    return (camera.x - a.x) * (b.x - a.x) + (camera.y - a.y) * (b.y - a.y) +
-      (camera.z - a.z) * (b.z - a.z) > 0;
+    const nx = b.x - a.x;
+    const ny = b.y - a.y;
+    const nz = b.z - a.z;
+    const nn = nx * nx + ny * ny + nz * nz;
+    if (nn === 0) {
+      return Math.abs(face._angle || 0) < 90 ? 1e9 : -1e9;
+    }
+    return ((camera.x - a.x) * nx + (camera.y - a.y) * ny + (camera.z - a.z) * nz) / nn;
   }
 
   // ------------------------------------------------- cube geometry (from the GNOME code)
